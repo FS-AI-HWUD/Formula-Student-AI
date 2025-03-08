@@ -18,3 +18,4 @@ install/
 
 # misc stuff
 .vscode/
+__pycache__/
