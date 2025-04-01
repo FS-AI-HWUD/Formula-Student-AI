@@ -22,3 +22,12 @@ cd fsai_ws/src/joseph_code
 ```shell
 python3 main.py
 ```
+
+
+# Ros2 version launch 
+```shell
+cd ~/ros2_ws
+colcon build --symlink-install
+source install/setup.bash
+ros2 launch my_carla_driver lidar_camera_fusion.launch.py
+```
