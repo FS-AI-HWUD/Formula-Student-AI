@@ -225,15 +225,7 @@ class PathPlanner:
         return 0.0  # Default: go straight
     
     def _pair_cones(self, cones, depths, min_track_width=2.0, max_track_width=6.0, depth_step=0.3):
-        """Pair cones to create a path through the center of the track with improved gap handling.
-        
-        Args:
-            cones (list): List of cone coordinates and classes
-            depths (list): List of cone depths
-            min_track_width (float): Minimum valid track width in meters
-            max_track_width (float): Maximum valid track width in meters
-            depth_step (float): Distance between waypoints in meters
-        """
+        """Improved cone pairing with better gap handling."""
         # Separate yellow and blue cones
         yellow_cones = [(c, d) for c, d in zip(cones, depths) if c[2] == 0]
         blue_cones = [(c, d) for c, d in zip(cones, depths) if c[2] == 1]
@@ -262,9 +254,6 @@ class PathPlanner:
         yellow_world.sort(key=lambda p: p[1])
         blue_world.sort(key=lambda p: p[1])
         
-        # Initialize waypoints at car position
-        waypoints = [(0.0, 0.5)]  # Start at car position
-        
         # Calculate track width from actual cone positions
         track_widths = []
         for y_pos in yellow_world:
@@ -280,6 +269,9 @@ class PathPlanner:
         track_width = np.median(track_widths) if track_widths else 3.5
         print(f"Calculated track width: {track_width:.2f}m")
         
+        # Initialize waypoints at car position
+        waypoints = [(0.0, 0.5)]  # Start at car position
+        
         # Store the last valid boundary positions to handle gaps
         last_valid_yellow_pos = None
         last_valid_blue_pos = None
@@ -287,6 +279,13 @@ class PathPlanner:
         # Track the last observed trend for each boundary
         yellow_trend = 0.0  # Direction of yellow boundary movement
         blue_trend = 0.0    # Direction of blue boundary movement
+        
+        # Store the last 3 yellow and blue cones for better trend analysis
+        recent_yellow = []
+        recent_blue = []
+        
+        # Set a limit for extrapolation - if we haven't seen cones for this distance, stop extrapolating
+        max_extrapolation_distance = 10.0  # meters
         
         # Find maximum detected cone depth
         max_depth = 15.0  # Default maximum depth
@@ -297,9 +296,6 @@ class PathPlanner:
         
         # Sample depths at higher resolution for better path continuity
         depths = np.arange(0.5, min(max_depth + 3.0, 20.0), depth_step)
-        
-        # Maximum allowed gap in meters before extrapolation is needed
-        max_gap_threshold = 6.0
         
         # Generate waypoints at each depth
         for depth in depths:
@@ -321,134 +317,133 @@ class PathPlanner:
                     best_b_dist = dist
                     closest_blue = b_pos
             
-            # Handle yellow boundary gaps
+            # Update recent cone lists for better trend analysis
+            if closest_yellow is not None:
+                recent_yellow.append(closest_yellow)
+                if len(recent_yellow) > 3:
+                    recent_yellow.pop(0)
+                last_valid_yellow_pos = closest_yellow
+                
+                # Calculate yellow trend if we have enough points
+                if len(recent_yellow) >= 2:
+                    # Sort by depth to ensure correct ordering
+                    sorted_recent = sorted(recent_yellow, key=lambda p: p[1])
+                    # Calculate average rate of lateral change
+                    lateral_changes = [(sorted_recent[i][0] - sorted_recent[i-1][0]) / 
+                                      max(0.1, sorted_recent[i][1] - sorted_recent[i-1][1])
+                                      for i in range(1, len(sorted_recent))]
+                    yellow_trend = sum(lateral_changes) / len(lateral_changes)
+            
+            if closest_blue is not None:
+                recent_blue.append(closest_blue)
+                if len(recent_blue) > 3:
+                    recent_blue.pop(0)
+                last_valid_blue_pos = closest_blue
+                
+                # Calculate blue trend
+                if len(recent_blue) >= 2:
+                    sorted_recent = sorted(recent_blue, key=lambda p: p[1])
+                    lateral_changes = [(sorted_recent[i][0] - sorted_recent[i-1][0]) / 
+                                      max(0.1, sorted_recent[i][1] - sorted_recent[i-1][1])
+                                      for i in range(1, len(sorted_recent))]
+                    blue_trend = sum(lateral_changes) / len(lateral_changes)
+            
+            # Handle yellow boundary gaps with improved extrapolation
             if closest_yellow is None and last_valid_yellow_pos is not None:
-                # Check if gap is too large
-                if depth - last_valid_yellow_pos[1] <= max_gap_threshold:
-                    # Extrapolate yellow position based on previous trend
-                    # Calculate trend if we have at least two previous yellow points
-                    if len(waypoints) >= 2 and yellow_world:
-                        # Find previous yellow points to determine trend
-                        prev_yellow_points = [y for y in yellow_world if y[1] < depth]
-                        if len(prev_yellow_points) >= 2:
-                            # Sort by depth to get the most recent points
-                            prev_yellow_points.sort(key=lambda p: p[1], reverse=True)
-                            if len(prev_yellow_points) >= 2:
-                                p1, p2 = prev_yellow_points[:2]
-                                # Calculate lateral change per meter of depth
-                                yellow_trend = (p1[0] - p2[0]) / max(0.1, p1[1] - p2[1])
-                    
-                    # Extrapolate position
-                    gap_distance = depth - last_valid_yellow_pos[1]
+                # Check if we're within valid extrapolation range
+                gap_distance = depth - last_valid_yellow_pos[1]
+                if gap_distance <= max_extrapolation_distance:
+                    # Calculate extrapolated position with better trend analysis
                     extrapolated_x = last_valid_yellow_pos[0] + yellow_trend * gap_distance
+                    
+                    # Apply non-linear adjustment for corners (make turns more aggressive)
+                    if abs(yellow_trend) > 0.1:  # If we're in a turn
+                        # Add quadratic component for sharper turns
+                        sign = 1 if yellow_trend > 0 else -1
+                        extrapolated_x += sign * 0.05 * gap_distance**2
+                    
                     closest_yellow = (extrapolated_x, depth)
                     print(f"Extrapolated yellow cone at depth {depth:.1f}m: x={extrapolated_x:.2f}m (trend: {yellow_trend:.2f})")
             
-            # Update last valid yellow position
-            if closest_yellow is not None:
-                last_valid_yellow_pos = closest_yellow
-            
-            # Handle blue boundary gaps
+            # Handle blue boundary gaps with similar improvements
             if closest_blue is None and last_valid_blue_pos is not None:
-                # Check if gap is too large
-                if depth - last_valid_blue_pos[1] <= max_gap_threshold:
-                    # Extrapolate blue position based on previous trend
-                    # Calculate trend if we have at least two previous blue points
-                    if len(waypoints) >= 2 and blue_world:
-                        # Find previous blue points to determine trend
-                        prev_blue_points = [b for b in blue_world if b[1] < depth]
-                        if len(prev_blue_points) >= 2:
-                            # Sort by depth to get the most recent points
-                            prev_blue_points.sort(key=lambda p: p[1], reverse=True)
-                            if len(prev_blue_points) >= 2:
-                                p1, p2 = prev_blue_points[:2]
-                                # Calculate lateral change per meter of depth
-                                blue_trend = (p1[0] - p2[0]) / max(0.1, p1[1] - p2[1])
-                    
-                    # Extrapolate position
-                    gap_distance = depth - last_valid_blue_pos[1]
+                gap_distance = depth - last_valid_blue_pos[1]
+                if gap_distance <= max_extrapolation_distance:
                     extrapolated_x = last_valid_blue_pos[0] + blue_trend * gap_distance
+                    
+                    # Apply non-linear adjustment for corners
+                    if abs(blue_trend) > 0.1:
+                        sign = 1 if blue_trend > 0 else -1
+                        extrapolated_x += sign * 0.05 * gap_distance**2
+                        
                     closest_blue = (extrapolated_x, depth)
                     print(f"Extrapolated blue cone at depth {depth:.1f}m: x={extrapolated_x:.2f}m (trend: {blue_trend:.2f})")
             
-            # Update last valid blue position
-            if closest_blue is not None:
-                last_valid_blue_pos = closest_blue
-            
-            # Generate waypoint based on available cones
+            # Generate waypoint based on available cones or extrapolations
             if closest_yellow is not None and closest_blue is not None:
                 # Both colors available - find midpoint
                 midpoint_x = (closest_yellow[0] + closest_blue[0]) / 2
                 waypoints.append((midpoint_x, depth))
             elif closest_yellow is not None:
-                # Only yellow - estimate blue position
-                estimated_blue_x = closest_yellow[0] - track_width
+                # Only yellow - estimate blue position based on track width and yellow trend
+                # If we're turning, adjust the estimated track width
+                adjusted_width = track_width
+                if abs(yellow_trend) > 0.1:  # We're in a turn
+                    # Reduce track width slightly in turns
+                    adjusted_width = track_width * (1.0 - min(0.2, abs(yellow_trend) * 0.5))
+                
+                estimated_blue_x = closest_yellow[0] - adjusted_width
                 midpoint_x = (closest_yellow[0] + estimated_blue_x) / 2
                 waypoints.append((midpoint_x, depth))
             elif closest_blue is not None:
-                # Only blue - estimate yellow position
-                estimated_yellow_x = closest_blue[0] + track_width
+                # Only blue - estimate yellow with similar adjustments
+                adjusted_width = track_width
+                if abs(blue_trend) > 0.1:
+                    adjusted_width = track_width * (1.0 - min(0.2, abs(blue_trend) * 0.5))
+                
+                estimated_yellow_x = closest_blue[0] + adjusted_width
                 midpoint_x = (estimated_yellow_x + closest_blue[0]) / 2
                 waypoints.append((midpoint_x, depth))
             else:
-                # No cones at this depth and no extrapolation was possible
-                # Continue in the same direction as recent waypoints trend
+                # No cones at this depth and no valid extrapolation
+                # If we have waypoints already, continue trend with extra caution
                 if len(waypoints) >= 2:
-                    # Calculate the trend from the last two waypoints
-                    last_x, last_y = waypoints[-1]
-                    prev_x, prev_y = waypoints[-2]
+                    # Use the last few waypoints to determine trend
+                    last_points = waypoints[-3:] if len(waypoints) >= 3 else waypoints[-2:]
                     
-                    # Calculate lateral change per meter
-                    if last_y > prev_y:  # Avoid division by zero
-                        lateral_trend = (last_x - prev_x) / (last_y - prev_y)
-                        # Add new waypoint continuing the trend
-                        extrapolated_x = last_x + lateral_trend * (depth - last_y)
-                        waypoints.append((extrapolated_x, depth))
-                    else:
-                        # Just continue straight if we can't determine trend
-                        waypoints.append((last_x, depth))
+                    # Calculate average lateral change
+                    if len(last_points) >= 2:
+                        x_diffs = [last_points[i][0] - last_points[i-1][0] for i in range(1, len(last_points))]
+                        y_diffs = [last_points[i][1] - last_points[i-1][1] for i in range(1, len(last_points))]
+                        
+                        # Calculate average rate of change if possible
+                        if any(y > 0.001 for y in y_diffs):
+                            rates = [x/y for x, y in zip(x_diffs, y_diffs) if y > 0.001]
+                            if rates:
+                                avg_rate = sum(rates) / len(rates)
+                                
+                                # Apply a damping factor - be more conservative with extrapolation
+                                damping = 0.7  # Reduce extrapolation aggressiveness
+                                damped_rate = avg_rate * damping
+                                
+                                # Calculate new position
+                                last_x, last_y = waypoints[-1]
+                                extrapolated_x = last_x + damped_rate * (depth - last_y)
+                                
+                                # Limit the deviation from forward path
+                                max_deviation = 3.0  # meters
+                                extrapolated_x = max(min(extrapolated_x, max_deviation), -max_deviation)
+                                
+                                waypoints.append((extrapolated_x, depth))
+                                continue
+                    
+                    # Fallback: continue straight with slight convergence to center
+                    last_x = waypoints[-1][0]
+                    convergence_factor = 0.05  # Gradually return to center
+                    waypoints.append((last_x * (1.0 - convergence_factor), depth))
                 else:
                     # With no history, continue straight
                     waypoints.append((0.0, depth))
-        
-        # Apply enhanced smoothing for better continuity
-        if len(waypoints) > 2:
-            # Initial smoothing to reduce noise
-            smoothed_waypoints = [waypoints[0]]  # Keep first point
-            for i in range(1, len(waypoints) - 1):
-                x, depth = waypoints[i]
-                prev_x = waypoints[i-1][0]
-                next_x = waypoints[i+1][0]
-                # Apply smoothing with adaptive weights
-                smoothed_x = 0.25 * prev_x + 0.5 * x + 0.25 * next_x
-                smoothed_waypoints.append((smoothed_x, depth))
-            smoothed_waypoints.append(waypoints[-1])  # Keep last point
-            
-            # Secondary pass with larger window for better continuity
-            final_waypoints = [smoothed_waypoints[0]]
-            for i in range(1, len(smoothed_waypoints) - 1):
-                x, depth = smoothed_waypoints[i]
-                
-                # Get wider context if available
-                window_size = 2
-                points_before = min(window_size, i)
-                points_after = min(window_size, len(smoothed_waypoints) - i - 1)
-                
-                window_x = [smoothed_waypoints[i-j][0] for j in range(1, points_before+1)]
-                window_x.append(x)
-                window_x.extend([smoothed_waypoints[i+j][0] for j in range(1, points_after+1)])
-                
-                # Apply Gaussian-like weighting
-                weights = [0.5 ** j for j in range(points_before, -1, -1)]
-                weights.extend([0.5 ** j for j in range(1, points_after+1)])
-                weights = [w / sum(weights) for w in weights]
-                
-                # Weighted average
-                weighted_x = sum(wx * w for wx, w in zip(window_x, weights))
-                final_waypoints.append((weighted_x, depth))
-            
-            final_waypoints.append(smoothed_waypoints[-1])
-            return final_waypoints
         
         return waypoints
     
@@ -1125,4 +1120,3 @@ class PathPlanner:
             traceback.print_exc()
             self.path = None
             return False
-

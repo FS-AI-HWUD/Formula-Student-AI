@@ -23,7 +23,6 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'carla_driver = my_carla_driver.main_node:main',
             'lidar_camera_fusion = my_carla_driver.lidar_camera_fusion:main',  # Added the LiDAR fusion node
         ],
     },

@@ -14,12 +14,12 @@ def generate_launch_description():
         name='lidar_camera_fusion',
         output='screen',
         parameters=[{
-            'model_path': '/home/dalek/Desktop/runs/detect/train8/weights/best.pt',
+            'model_path': '/runs/best.pt',
             'use_carla': True,
-            'output_dir': '/home/dalek/attempt_1/Lidar_test/dataset',
+            'output_dir': '/fsai_ws/src/my_carla_driver/my_carla_driver/dataset',
             'show_opencv_windows': False,  # Set to False to only use RViz
             'lidar_point_size': 0.4,  # Increased size of LiDAR points in meters
-            'pointnet_model_path': '/home/dalek/attempt_1/pointnet_detector.pth',  # Path to PointNet model
+            'pointnet_model_path': 'fsai_ws/src/my_carla_driver/my_carla_driver/pointnet_detector.pth',  # Path to PointNet model
             'accumulate_lidar_frames': 3,  # Number of frames to accumulate for denser visualization
         }]
     )
