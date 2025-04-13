@@ -1,7 +1,4 @@
-# To access the carla simulation
-"Note the carla simulation will require high gpu power for the simulation".
-
-this is the repository for the carla map and also how to start it up
+# Access the Carla simulation
 ```shell
 
 cd /Carla-0.10.0-Linux-Shipping/Linux$
@@ -9,25 +6,11 @@ cd /Carla-0.10.0-Linux-Shipping/Linux$
 ./CarlaUnreal.sh
 ```
 
-#Run the carla code
-```shell
-cd fsai_ws/src/joseph_code
-```
-- There will be four files of python code that are currently there
-    - Main.py
-    - Path_planner.py
-    - lidar_integration
-    - lidar_3d_visualizer.py
-- To run all these codes together you only run in the terminal workspace
-```shell
-python3 main.py
-```
+# Setup the ROS Workspace
+1. First cd into the directory fsai_ws and then source ros2 using `source /opt/ros/humble/setup.bash`
 
+2. Then build the workspace using `colcon build --symlink-install`
 
-# Ros2 version launch 
-```shell
-cd ~/ros2_ws
-colcon build --symlink-install
-source install/setup.bash
-ros2 launch my_carla_driver lidar_camera_fusion.launch.py
-```
+3. Then source the workspace itself using `source install/setup.bash`
+
+4. Run the simulation using `ros2 launch my_carla_driver lidar_camera_fusion.launch.py`
