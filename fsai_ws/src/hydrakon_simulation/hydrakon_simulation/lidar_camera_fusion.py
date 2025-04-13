@@ -324,7 +324,7 @@ class LidarCameraFusionNode(Node):
             if not hasattr(self, 'pointnet_model'):
                 # Check if model path is set
                 if not hasattr(self, 'pointnet_model_path'):
-                    self.pointnet_model_path = "/home/dalek/attempt_1/pointnet_detector.pth"
+                    self.pointnet_model_path = "fsai_ws/src/hydrakon_simulation/hydrakon_simulation/pointnet_detector.pth"
                     self.get_logger().info(f"Using default PointNet model path: {self.pointnet_model_path}")
                 
                 # Load PointNet model
