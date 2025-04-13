@@ -48,10 +48,10 @@ class LidarCameraFusionNode(Node):
         self.declare_parameter('carla.host', 'localhost')
         self.declare_parameter('carla.port', 2000)
         self.declare_parameter('carla.timeout', 10.0)
-        self.declare_parameter('output_dir', '/fsai_ws/src/my_carla_driver/my_carla_driver/dataset')
+        self.declare_parameter('output_dir', '/fsai_ws/src/hydrakon_simulation/hydrakon_simulation/dataset')
         self.declare_parameter('show_opencv_windows', True)
         self.declare_parameter('lidar_point_size', 0.4)  # Increased default point size
-        self.declare_parameter('pointnet_model_path', 'fsai_ws/src/my_carla_driver/my_carla_driver/pointnet_detector.pth')
+        self.declare_parameter('pointnet_model_path', 'fsai_ws/src/hydrakon_simulation/hydrakon_simulation/pointnet_detector.pth')
         self.declare_parameter('accumulate_lidar_frames', 3)  # Number of frames to accumulate
         
         # Get parameters

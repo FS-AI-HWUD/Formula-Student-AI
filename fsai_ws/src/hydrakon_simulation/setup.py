@@ -1,7 +1,7 @@
 from setuptools import setup
 import os
 from glob import glob
-package_name = 'my_carla_driver'
+package_name = 'hydrakon_simulation'
 setup(
     name=package_name,
     version='0.0.0',
@@ -16,14 +16,14 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='Your Name',
-    maintainer_email='your.email@example.com',
+    maintainer='Joseph Abdo',
+    maintainer_email='gravityfallsuae@gmail.com',
     description='Carla autonomous driving package with cone detection',
-    license='TODO: License declaration',
+    license='Apache 2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'lidar_camera_fusion = my_carla_driver.lidar_camera_fusion:main',  # Added the LiDAR fusion node
+            'lidar_camera_fusion = hydrakon_simulation.lidar_camera_fusion:main',  # Added the LiDAR fusion node
         ],
     },
 )

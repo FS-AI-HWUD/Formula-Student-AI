@@ -9,17 +9,17 @@ def generate_launch_description():
     
     # Add the fusion node
     fusion_node = Node(
-        package='my_carla_driver',
+        package='hydrakon_simulation',
         executable='lidar_camera_fusion',
         name='lidar_camera_fusion',
         output='screen',
         parameters=[{
             'model_path': '/runs/best.pt',
             'use_carla': True,
-            'output_dir': '/fsai_ws/src/my_carla_driver/my_carla_driver/dataset',
+            'output_dir': '/fsai_ws/src/hydrakon_simulation/hydrakon_simulation/dataset',
             'show_opencv_windows': False,  # Set to False to only use RViz
             'lidar_point_size': 0.4,  # Increased size of LiDAR points in meters
-            'pointnet_model_path': 'fsai_ws/src/my_carla_driver/my_carla_driver/pointnet_detector.pth',  # Path to PointNet model
+            'pointnet_model_path': 'fsai_ws/src/hydrakon_simulation/hydrakon_simulation/pointnet_detector.pth',  # Path to PointNet model
             'accumulate_lidar_frames': 3,  # Number of frames to accumulate for denser visualization
         }]
     )
