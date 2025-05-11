@@ -1,0 +1,13 @@
+train: ./Dataset/train/images
+val: ./Dataset/valid/images
+test: ./Dataset/test/images
+
+nc: 4
+names: ['blue_cone', 'large_orange_cone', 'orange_cone', 'yellow_cone']
+
+roboflow:
+  workspace: ourdataset1
+  project: test-77tmf
+  version: 7
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/ourdataset1/test-77tmf/dataset/7
