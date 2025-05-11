@@ -16,6 +16,10 @@ install/
 *.run.xml
 *.out
 
+# Python stuff
+venv/
+
 # misc stuff
 .vscode/
 __pycache__/
+
