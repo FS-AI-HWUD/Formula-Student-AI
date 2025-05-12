@@ -16,6 +16,15 @@ install/
 *.run.xml
 *.out
 
+# Python stuff
+venv/
+
 # misc stuff
 .vscode/
 __pycache__/
+
+# YOLO Test files
+*.avi
+yolo11n.pt 
+yolov8n.pt
+*.cache
