@@ -20,12 +20,12 @@ options = {
   map_builder = MAP_BUILDER,
   trajectory_builder = TRAJECTORY_BUILDER,
   map_frame = "map",
-  tracking_frame = "map",
-  published_frame = "map",
+  tracking_frame = "base_link",
+  published_frame = "base_link",
      -- Change this to "map" as well
   odom_frame = "odom",
   provide_odom_frame = true,
-  publish_frame_projected_to_2d = false,
+  publish_frame_projected_to_2d = true,
   use_odometry = false,
   use_nav_sat = false,
   use_landmarks = false,
@@ -47,7 +47,10 @@ options = {
 MAP_BUILDER.use_trajectory_builder_3d = true
 MAP_BUILDER.num_background_threads = 7
 
-TRAJECTORY_BUILDER_3D.num_accumulated_range_data = 5
+TRAJECTORY_BUILDER_3D = {
+  use_imu_data = false,
+  num_accumulated_range_data = 5,
+}
 
 POSE_GRAPH.optimization_problem.huber_scale = 5e2
 POSE_GRAPH.optimize_every_n_nodes = 320

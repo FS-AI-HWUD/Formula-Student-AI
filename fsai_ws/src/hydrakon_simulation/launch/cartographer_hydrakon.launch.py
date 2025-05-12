@@ -31,21 +31,21 @@ def generate_launch_description():
             default_value='true',
             description='Use simulation clock if true'),
             
-        # Since CARLA's point clouds are in the "map" frame already, we just need
-        # to connect other frames properly
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='static_transform_publisher_map_to_odom',
-            arguments=['0', '0', '0', '0', '0', '0', 'map', 'odom']
-        ),
+        # # Since CARLA's point clouds are in the "map" frame already, we just need
+        # # to connect other frames properly
+        # Node(
+        #     package='tf2_ros',
+        #     executable='static_transform_publisher',
+        #     name='static_transform_publisher_map_to_odom',
+        #     arguments=['0', '0', '0', '0', '0', '0', 'map', 'odom']
+        # ),
         
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='static_transform_publisher_map_to_ego',
-            arguments=['0', '0', '0', '0', '0', '0', 'map', 'base_link']
-        ),
+        # Node(
+        #     package='tf2_ros',
+        #     executable='static_transform_publisher',
+        #     name='static_transform_publisher_map_to_ego',
+        #     arguments=['0', '0', '0', '0', '0', '0', 'map', 'base_link']
+        # ),
         
         # Cartographer node - IMPORTANT: We use the existing frame_id of the point cloud
         Node(
@@ -57,7 +57,7 @@ def generate_launch_description():
             arguments=['-configuration_directory', config_dir,
                       '-configuration_basename', 'lidar_camera_fusion.lua', '--v=3'], # Enable verbose logging
             remappings=[
-                ('points2', '/carla/lidar_points'),
+                ("points2", "/carla/lidar_points"),
             ]),
             
         # Occupancy grid node for visualization
