@@ -12,7 +12,7 @@ specifically designed for cone-based Formula Student autonomous racing.
 It focuses on looking ahead for 3 cone pairs to determine the optimal path
 and steering angle based on the pure pursuit algorithm.
 
-Author: Formula Student Team
+Author: Atlas Racing
 """
 
 class WorldCone:
