@@ -272,7 +272,7 @@ typedef struct can_stats_struct {
 	volatile uint32_t unhandled_frame_count;
 } can_stats_t;
 
-int fs_ai_api_init(char *CAN_interface, int debug, int simulate);
+int fs_ai_api_init(const char *CAN_interface, int debug, int simulate);
 
 void fs_ai_api_vcu2ai_get_data(fs_ai_api_vcu2ai *data);
 void fs_ai_api_ai2vcu_set_data(fs_ai_api_ai2vcu *data);

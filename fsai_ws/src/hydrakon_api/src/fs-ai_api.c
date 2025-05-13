@@ -47,6 +47,7 @@ SOFTWARE.
 #include "hydrakon_api/can.h"
 
 #include "hydrakon_api/fs-ai_api.h"
+// #include <linux/time.h>
 
 
 // typedefs
@@ -553,7 +554,7 @@ static void *can_read_thread() {
 }
 
 
-int fs_ai_api_init(char* CAN_interface, int debug, int simulate) {
+int fs_ai_api_init(const char* CAN_interface, int debug, int simulate) {
 	static boolean_e initialised = FALSE;
 	int err;
 
@@ -806,6 +807,9 @@ void fs_ai_api_ai2vcu_set_data(fs_ai_api_ai2vcu *data) {
 	AI2VCU_STEER_REQUEST_raw = (int16_t)(10.0f*t_AI2VCU_STEER_ANGLE_REQUEST_deg);
 	AI2VCU_FRONT_MOTOR_SPEED_MAX_rpm = (uint16_t)t_AI2VCU_FRONT_MOTOR_SPEED_REQUEST_rpm;
 	AI2VCU_REAR_MOTOR_SPEED_MAX_rpm = (uint16_t)t_AI2VCU_REAR_MOTOR_SPEED_REQUEST_rpm;
+	printf(">>> TORQUE_IN: %f, ENCODED: %u\n", t_AI2VCU_FRONT_AXLE_TORQUE_REQUEST_Nm,
+       (uint16_t)(10.0f*t_AI2VCU_FRONT_AXLE_TORQUE_REQUEST_Nm));
+
 	AI2VCU_FRONT_AXLE_TRQ_REQUEST_raw = (uint16_t)(10.0f*t_AI2VCU_FRONT_AXLE_TORQUE_REQUEST_Nm);
 	AI2VCU_REAR_AXLE_TRQ_REQUEST_raw = (uint16_t)(10.0f*t_AI2VCU_REAR_AXLE_TORQUE_REQUEST_Nm);
 	AI2VCU_HYD_PRESS_F_REQ_raw = (uint8_t)(2.0f*t_AI2VCU_FRONT_BRAKE_PRESS_REQUEST_pct);
