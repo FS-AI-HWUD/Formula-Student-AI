@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
 import numpy as np
@@ -12,10 +11,8 @@ from std_msgs.msg import Header
 import sensor_msgs_py.point_cloud2 as pc2
 from cv_bridge import CvBridge
 from tf2_ros import TransformBroadcaster
-from geometry_msgs.msg import TransformStamped, Transform, Vector3, Quaternion, PoseStamped
+from geometry_msgs.msg import TransformStamped, Transform, Vector3, Quaternion, PoseStamped, Point
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point
-from std_msgs.msg import ColorRGBA
 from nav_msgs.msg import Path
 import carla
 import sys
@@ -24,8 +21,9 @@ import torch
 from sklearn.cluster import DBSCAN
 
 # Import your existing modules
-from .zed_2i import Zed2iCamera  # Import from the same package # Will need to modify this # Will need to modify this
-from .path_planning import PathPlanner
+from .zed_2i import Zed2iCamera
+# Import the new path planner
+from .path_planning import PathPlanner, WorldCone, ConePair
 
 
 def transform_points(points, transform):
@@ -43,16 +41,23 @@ class LidarCameraFusionNode(Node):
         super().__init__('lidar_camera_fusion_node')
         
         # Declare parameters
-        self.declare_parameter('model_path', '/runs/best.pt')
+        self.declare_parameter('model_path', '/home/aditya/Documents/Hydrakon/src/my_carla_driver/model/best.pt')
         self.declare_parameter('use_carla', True)
         self.declare_parameter('carla.host', 'localhost')
         self.declare_parameter('carla.port', 2000)
         self.declare_parameter('carla.timeout', 10.0)
-        self.declare_parameter('output_dir', '/fsai_ws/src/hydrakon_simulation/hydrakon_simulation/dataset')
+        self.declare_parameter('output_dir', '/home/aditya/Documents/Hydrakon/src/my_carla_driver/model/dataset')
         self.declare_parameter('show_opencv_windows', True)
         self.declare_parameter('lidar_point_size', 0.4)  # Increased default point size
-        self.declare_parameter('pointnet_model_path', 'fsai_ws/src/hydrakon_simulation/hydrakon_simulation/pointnet_detector.pth')
+        self.declare_parameter('pointnet_model_path', '/home/aditya/Documents/Hydrakon/src/my_carla_driver/model/pointnet_detector.pth')
         self.declare_parameter('accumulate_lidar_frames', 3)  # Number of frames to accumulate
+        
+        # Parameters for Pure Pursuit
+        self.declare_parameter('pure_pursuit.lookahead_distance', 4.0)
+        self.declare_parameter('pure_pursuit.max_lookahead_pairs', 3)
+        self.declare_parameter('pure_pursuit.depth_min', 1.0)
+        self.declare_parameter('pure_pursuit.depth_max', 20.0)
+        self.declare_parameter('pure_pursuit.default_track_width', 3.5)
         
         # Get parameters
         self.model_path = self.get_parameter('model_path').value
@@ -65,6 +70,13 @@ class LidarCameraFusionNode(Node):
         self.lidar_point_size = self.get_parameter('lidar_point_size').value
         self.pointnet_model_path = self.get_parameter('pointnet_model_path').value
         self.accumulate_frames = self.get_parameter('accumulate_lidar_frames').value
+        
+        # Pure Pursuit parameters
+        self.lookahead_distance = self.get_parameter('pure_pursuit.lookahead_distance').value
+        self.max_lookahead_pairs = self.get_parameter('pure_pursuit.max_lookahead_pairs').value
+        self.pp_depth_min = self.get_parameter('pure_pursuit.depth_min').value
+        self.pp_depth_max = self.get_parameter('pure_pursuit.depth_max').value
+        self.default_track_width = self.get_parameter('pure_pursuit.default_track_width').value
         
         # Bridge for converting between ROS and OpenCV images
         self.bridge = CvBridge()
@@ -95,6 +107,21 @@ class LidarCameraFusionNode(Node):
         self.lidar_history = []
         self.lidar_history_lock = Lock()
         
+        # Vehicle tracking
+        self.vehicle_poses = []
+        self.cone_map = []
+        
+        # Initialize speed and steering control variables
+        self.prev_target_speed = 0.0
+        self.prev_steering = 0.0
+        
+        # Turn detection state
+        self.lidar_right_turn_detected = False
+        self.lidar_left_turn_detected = False
+        self.lidar_turn_distance = float('inf')
+        self.lidar_turn_confidence = 0.0
+        self.uturn_state = {'detected': False, 'distance': float('inf'), 'score': 0.0, 'direction': 'right'}
+        
         # Timer for main processing
         self.timer = self.create_timer(0.05, self.timer_callback)  # 20 Hz
         
@@ -115,6 +142,13 @@ class LidarCameraFusionNode(Node):
             self.world = client.get_world()
             self.get_logger().info("Connected to CARLA world successfully")
             
+            # Set fixed time step for better stability
+            settings = self.world.get_settings()
+            settings.fixed_delta_seconds = 0.05  # 20 Hz - match our timer callback
+            settings.synchronous_mode = True  # Enable synchronous mode
+            self.world.apply_settings(settings)
+            self.get_logger().info("Applied synchronous mode settings")
+            
             self.vehicle = self.spawn_vehicle()
             if not self.vehicle:
                 self.get_logger().error("Failed to spawn vehicle")
@@ -129,13 +163,19 @@ class LidarCameraFusionNode(Node):
             if not self.zed_camera.setup():
                 self.get_logger().error("Failed to setup ZED camera")
                 return False
-                
-            # Initialize path planner
+            
+            # Initialize path planner using the new pure pursuit planner
             self.path_planner = PathPlanner(self.zed_camera, 
-                                           depth_min=1.0, 
-                                           depth_max=20.0, 
+                                           depth_min=self.pp_depth_min, 
+                                           depth_max=self.pp_depth_max, 
                                            cone_spacing=1.5, 
                                            visualize=True)
+            
+            # Configure path planner
+            self.path_planner.lookahead_distance = self.lookahead_distance
+            self.path_planner.max_lookahead_pairs = self.max_lookahead_pairs
+            self.path_planner.default_track_width = self.default_track_width
+            self.get_logger().info(f"Pure pursuit path planner configured with lookahead={self.lookahead_distance}m")
             
             # Setup LiDAR
             if not self.setup_lidar():
@@ -150,6 +190,9 @@ class LidarCameraFusionNode(Node):
                 self.get_logger().info("OpenCV visualization enabled")
             else:
                 self.get_logger().info("OpenCV visualization disabled (use RViz)")
+            
+            # Initial car movement - push forward to ensure physics engagement
+            self.set_initial_movement()
                 
             self.get_logger().info("Carla setup completed successfully")
             return True
@@ -159,6 +202,192 @@ class LidarCameraFusionNode(Node):
             import traceback
             self.get_logger().error(traceback.format_exc())
             return False
+        
+    def _enhance_path_with_lidar_boundaries(self, lidar_boundaries):
+        """
+        Enhance the current path using LiDAR boundary information.
+        
+        Args:
+            lidar_boundaries: Dictionary with 'left_boundary' and 'right_boundary' points
+        """
+        try:
+            left_boundary = lidar_boundaries.get('left_boundary', [])
+            right_boundary = lidar_boundaries.get('right_boundary', [])
+            
+            if not left_boundary and not right_boundary:
+                return
+                
+            self.get_logger().info(f"Enhancing path with LiDAR boundaries: {len(left_boundary)} left, "
+                                   f"{len(right_boundary)} right points")
+            
+            # If we don't have a path yet, create one from LiDAR boundaries
+            if not self.path_planner.path or len(self.path_planner.path) < 2:
+                path_points = []
+                
+                # Get all depth points from boundaries
+                all_depths = []
+                for x, depth in left_boundary:
+                    all_depths.append(depth)
+                for x, depth in right_boundary:
+                    all_depths.append(depth)
+                
+                # Sort and remove duplicates
+                all_depths = sorted(set(all_depths))
+                
+                # For each depth, find the midpoint between left and right boundaries
+                for depth in all_depths:
+                    left_x = None
+                    right_x = None
+                    
+                    # Find closest left boundary point
+                    best_left_dist = float('inf')
+                    for x, d in left_boundary:
+                        dist = abs(d - depth)
+                        if dist < best_left_dist:
+                            best_left_dist = dist
+                            left_x = x
+                    
+                    # Find closest right boundary point
+                    best_right_dist = float('inf')
+                    for x, d in right_boundary:
+                        dist = abs(d - depth)
+                        if dist < best_right_dist:
+                            best_right_dist = dist
+                            right_x = x
+                    
+                    # If we have both boundaries, calculate midpoint
+                    if left_x is not None and right_x is not None and best_left_dist < 2.0 and best_right_dist < 2.0:
+                        mid_x = (left_x + right_x) / 2
+                        path_points.append((mid_x, depth))
+                    # If we only have left boundary, estimate midpoint
+                    elif left_x is not None and best_left_dist < 2.0:
+                        mid_x = left_x + self.path_planner.default_track_width / 2
+                        path_points.append((mid_x, depth))
+                    # If we only have right boundary, estimate midpoint
+                    elif right_x is not None and best_right_dist < 2.0:
+                        mid_x = right_x - self.path_planner.default_track_width / 2
+                        path_points.append((mid_x, depth))
+                
+                if path_points:
+                    # Sort by depth
+                    path_points.sort(key=lambda p: p[1])
+                    
+                    # Add a point at vehicle position
+                    path_points.insert(0, (0.0, 0.5))
+                    
+                    # Set as path
+                    self.path_planner.path = path_points
+                    self.get_logger().info(f"Created path from LiDAR boundaries with {len(path_points)} points")
+            
+            # If we already have a path, try to extend it
+            elif self.path_planner.path:
+                # Get maximum depth of existing path
+                max_depth = max([p[1] for p in self.path_planner.path])
+                
+                # Find boundary points beyond current path
+                extension_points = []
+                
+                for depth in sorted(set([d for _, d in left_boundary + right_boundary])):
+                    if depth > max_depth + 1.0:  # Beyond current path
+                        left_x = None
+                        right_x = None
+                        
+                        # Find closest left boundary point
+                        best_left_dist = float('inf')
+                        for x, d in left_boundary:
+                            if abs(d - depth) < best_left_dist:
+                                best_left_dist = abs(d - depth)
+                                left_x = x
+                        
+                        # Find closest right boundary point
+                        best_right_dist = float('inf')
+                        for x, d in right_boundary:
+                            if abs(d - depth) < best_right_dist:
+                                best_right_dist = abs(d - depth)
+                                right_x = x
+                        
+                        # Calculate midpoint if possible
+                        if left_x is not None and right_x is not None and best_left_dist < 2.0 and best_right_dist < 2.0:
+                            mid_x = (left_x + right_x) / 2
+                            extension_points.append((mid_x, depth))
+                        elif left_x is not None and best_left_dist < 2.0:
+                            # Estimate from left boundary
+                            last_width = self.path_planner.default_track_width
+                            if len(self.path_planner.path) >= 2:
+                                # Try to maintain similar track width
+                                for i in range(len(self.path_planner.path) - 1, 0, -1):
+                                    p = self.path_planner.path[i]
+                                    # Find a nearby left boundary point to estimate width
+                                    for x, d in left_boundary:
+                                        if abs(d - p[1]) < 1.0:
+                                            last_width = abs(p[0] - x) * 2
+                                            break
+                            mid_x = left_x + last_width / 2
+                            extension_points.append((mid_x, depth))
+                        elif right_x is not None and best_right_dist < 2.0:
+                            # Estimate from right boundary
+                            last_width = self.path_planner.default_track_width
+                            if len(self.path_planner.path) >= 2:
+                                # Try to maintain similar track width
+                                for i in range(len(self.path_planner.path) - 1, 0, -1):
+                                    p = self.path_planner.path[i]
+                                    # Find a nearby right boundary point to estimate width
+                                    for x, d in right_boundary:
+                                        if abs(d - p[1]) < 1.0:
+                                            last_width = abs(p[0] - x) * 2
+                                            break
+                            mid_x = right_x - last_width / 2
+                            extension_points.append((mid_x, depth))
+                
+                if extension_points:
+                    # Sort by depth
+                    extension_points.sort(key=lambda p: p[1])
+                    
+                    # Add to existing path
+                    self.path_planner.path.extend(extension_points)
+                    
+                    # Limit path length if needed
+                    max_path_points = 20
+                    if len(self.path_planner.path) > max_path_points:
+                        self.path_planner.path = self.path_planner.path[:max_path_points]
+                    
+                    self.get_logger().info(f"Extended path with {len(extension_points)} points from LiDAR boundaries")
+                    
+                    # Update target point for pure pursuit
+                    if hasattr(self.path_planner, '_find_target_point'):
+                        self.path_planner._find_target_point()
+        
+        except Exception as e:
+            self.get_logger().error(f"Error enhancing path with LiDAR boundaries: {str(e)}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())#!/usr/bin/env python3
+            
+    def set_initial_movement(self):
+        """Apply initial throttle to ensure the vehicle is properly engaged in physics."""
+        if not self.vehicle:
+            return
+            
+        try:
+            # Create control command with aggressive forward motion
+            control = carla.VehicleControl()
+            control.throttle = 0.8  # Increased from 0.5 to 0.8 - stronger initial throttle
+            control.steer = 0.0
+            control.brake = 0.0
+            control.hand_brake = False
+            control.reverse = False
+            
+            # Apply control to vehicle
+            self.vehicle.apply_control(control)
+            
+            # Tick the world multiple times to ensure physics engagement
+            for _ in range(10):  # Increased from 5 to 10 ticks for better initial movement
+                self.world.tick()
+                
+            self.get_logger().info("Applied strong initial movement to engage vehicle physics")
+        except Exception as e:
+            self.get_logger().error(f"Error setting initial movement: {str(e)}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
     
     def spawn_vehicle(self):
         """Spawn a vehicle in the CARLA world."""
@@ -251,23 +480,29 @@ class LidarCameraFusionNode(Node):
             return
             
         try:
+            # Tick the world in synchronous mode
+            if hasattr(self, 'world') and self.world:
+                settings = self.world.get_settings()
+                if settings.synchronous_mode:
+                    self.world.tick()
+                    
             # Process camera frame
             self.zed_camera.process_frame()
             
             # Process LiDAR data
             self.process_lidar_data()
             
-            # Visualize current PCD data
-            self.visualize_pcd_data()
+            # Fuse camera and LiDAR data - extract boundaries or cones
+            lidar_boundaries = self.extract_lidar_boundaries()
             
-            # Update PCD browser
-            self.update_pcd_file_list()
-            
-            # Handle keyboard input
-            self.handle_keyboard_input()
-            
-            # Plan path
-            self.path_planner.plan_path()
+            # Plan path using Pure Pursuit planner with fusion data
+            if self.path_planner:
+                # Process detections regularly since plan_path_with_fusion doesn't exist
+                self.path_planner.plan_path()
+                
+                # Add custom code to enhance with LiDAR boundaries
+                if lidar_boundaries and ('left_boundary' in lidar_boundaries or 'right_boundary' in lidar_boundaries):
+                    self._enhance_path_with_lidar_boundaries(lidar_boundaries)
             
             # Control the car and measure latency
             start_time = time.time()
@@ -279,40 +514,99 @@ class LidarCameraFusionNode(Node):
             if hasattr(self, 'vehicle') and self.vehicle:
                 velocity = self.vehicle.get_velocity()
                 current_speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+                
+                # Log current speed for debugging
+                self.get_logger().info(f"Current vehicle speed: {current_speed:.2f} m/s ({current_speed * 2.237:.2f} mph)")
             
-            # Update and publish metrics
-            self.update_and_publish_metrics(control_latency, current_speed, self.prev_target_speed)
-            
-            # Visualize detected cones
-            self.visualize_detected_cones()
-            
-            # Publish camera and path data for RViz
-            self.publish_data()
-            
-            # Publish path for RViz
+            # Publish path visualization for RViz
             self.publish_path_for_rviz()
+            
+            # Publish data for visualization
+            self.publish_data()
             
             # Broadcast transforms
             self.broadcast_tf()
-
-            # Publish visualization data
-            self.publish_cone_map(self.cone_mapper)
-            self.publish_path(self.path_planner)
-            if hasattr(self, 'latest_point_cloud'):
-                self.publish_lidar_points(self.latest_point_cloud)
-
-            # Save map and path periodically (e.g., every 100 updates)
-            if self.cone_mapper.total_updates % 100 == 0:
-                self.save_map_and_path()
+            
+            # Visualize cone detections
+            self.visualize_detected_cones()
+            
+            # Create system performance metrics
+            self.update_and_publish_metrics(control_latency, current_speed, self.prev_target_speed)
             
         except Exception as e:
             self.get_logger().error(f"Error in timer callback: {str(e)}")
             import traceback
             self.get_logger().error(traceback.format_exc())
     
+    def extract_lidar_boundaries(self):
+        """
+        Extract track boundaries from LiDAR points to enhance path planning.
+        
+        Returns:
+            Dictionary with 'left_boundary' and 'right_boundary' points
+        """
+        if not hasattr(self, 'latest_lidar_points') or self.latest_lidar_points is None:
+            return None
+            
+        try:
+            boundaries = {'left_boundary': [], 'right_boundary': []}
+            
+            # Get a copy of the points
+            points = self.latest_lidar_points.copy()
+            
+            # Filter points by height (typical cone height range)
+            ground_level = np.min(points[:, 2]) if len(points) > 0 else 0
+            height_min = ground_level + 0.05  # 5cm above ground
+            height_max = ground_level + 0.5   # Up to 50cm tall (cone height)
+            
+            height_mask = (points[:, 2] >= height_min) & (points[:, 2] <= height_max)
+            filtered_points = points[height_mask]
+            
+            if len(filtered_points) < 10:
+                return boundaries
+            
+            # Convert to 2D points (top-down view)
+            points_2d = filtered_points[:, :2]  # Only X and Y
+            
+            # Use clustering to find potential cones or boundary points
+            clustering = DBSCAN(eps=0.5, min_samples=5).fit(points_2d)
+            labels = clustering.labels_
+            
+            # Process clusters
+            for label in set(labels):
+                if label == -1:  # Skip noise
+                    continue
+                    
+                # Get points in this cluster
+                cluster_points = points_2d[labels == label]
+                center = np.mean(cluster_points, axis=0)
+                
+                # Determine if this is a boundary point
+                # Classify based on X position (left/right of vehicle)
+                # In vehicle coordinates: +X is right, +Y is forward
+                if center[0] > 0.5:  # Right side
+                    boundaries['right_boundary'].append((float(center[0]), float(center[1])))
+                elif center[0] < -0.5:  # Left side
+                    boundaries['left_boundary'].append((float(center[0]), float(center[1])))
+            
+            # Sort by distance (Y coordinate)
+            if boundaries['left_boundary']:
+                boundaries['left_boundary'].sort(key=lambda p: p[1])
+            if boundaries['right_boundary']:
+                boundaries['right_boundary'].sort(key=lambda p: p[1])
+            
+            self.get_logger().info(f"Extracted boundaries: {len(boundaries['left_boundary'])} left, "
+                                  f"{len(boundaries['right_boundary'])} right points")
+            
+            return boundaries
+            
+        except Exception as e:
+            self.get_logger().error(f"Error extracting LiDAR boundaries: {str(e)}")
+            return {'left_boundary': [], 'right_boundary': []}
+    
     def detect_cones_from_lidar(self, lidar_points):
         """
-        Use PointNet model to detect cones from LiDAR point cloud
+        Detect cones from LiDAR point cloud
         
         Args:
             lidar_points: Numpy array of shape (N, 3) containing LiDAR points
@@ -321,35 +615,13 @@ class LidarCameraFusionNode(Node):
             list of detected cones with position and confidence
         """
         try:
-            if not hasattr(self, 'pointnet_model'):
-                # Check if model path is set
-                if not hasattr(self, 'pointnet_model_path'):
-                    self.pointnet_model_path = "fsai_ws/src/hydrakon_simulation/hydrakon_simulation/pointnet_detector.pth"
-                    self.get_logger().info(f"Using default PointNet model path: {self.pointnet_model_path}")
-                
-                # Load PointNet model
-                if os.path.exists(self.pointnet_model_path):
-                    self.get_logger().info(f"Loading PointNet model from {self.pointnet_model_path}")
-                    self.pointnet_model = torch.load(self.pointnet_model_path, map_location=torch.device('cpu'))
-                    self.pointnet_model.eval()  # Set to evaluation mode
-                else:
-                    self.get_logger().error(f"PointNet model not found at {self.pointnet_model_path}")
-                    return []
-            
-            # Need to preprocess point cloud for PointNet
             if len(lidar_points) < 10:  # Need minimum number of points
                 return []
                 
-            # Here we would normally preprocess the points for PointNet
-            # For demonstration, we'll simulate detections
-            # In a real implementation, you would run the model on the points
-            
-            # Find clusters of points that might be cones
-            # This is a simplified approach - real implementation would use the PointNet model
+            # Simple clustering to find cone-like objects
             detected_cones = []
             
-            # Simple clustering - find points close to ground and cluster them
-            # In 3D space, cones are typically small clusters of points
+            # Find clusters of points close to ground
             ground_height = np.min(lidar_points[:, 2]) + 0.1  # Slightly above ground
             
             # Filter points close to ground
@@ -357,9 +629,6 @@ class LidarCameraFusionNode(Node):
             near_ground_points = lidar_points[near_ground_mask]
             
             if len(near_ground_points) > 5:
-                # Very simple clustering - just for demonstration
-                # A real implementation would use DBSCAN or another clustering algorithm
-                
                 # Cluster points
                 clustering = DBSCAN(eps=0.5, min_samples=5).fit(near_ground_points[:, :3])
                 labels = clustering.labels_
@@ -382,14 +651,117 @@ class LidarCameraFusionNode(Node):
                                 'size': [0.3, 0.3, 0.4]  # Approximate cone size
                             })
             
-            self.get_logger().info(f"Detected {len(detected_cones)} cones from LiDAR using PointNet")
+            self.get_logger().info(f"Detected {len(detected_cones)} cones from LiDAR")
             return detected_cones
             
         except Exception as e:
-            self.get_logger().error(f"Error in PointNet detection: {str(e)}")
+            self.get_logger().error(f"Error in cone detection: {str(e)}")
             import traceback
             self.get_logger().error(traceback.format_exc())
             return []
+
+    def process_lidar_data(self):
+        """Process and analyze LiDAR data."""
+        if self.lidar is None or not hasattr(self, 'lidar_data') or self.lidar_data is None:
+            self.get_logger().warn("LiDAR data not available")
+            return
+            
+        try:
+            # Get sensor transform
+            sensor_transform = np.array(self.lidar.get_transform().get_matrix())
+            
+            # Transform LiDAR points from sensor to world coordinates
+            with self.lidar_lock:
+                lidar_data = self.lidar_data.copy()
+                point_count = len(lidar_data)
+            
+            self.get_logger().info(f"Processing {point_count} LiDAR points")
+            
+            if lidar_data.size == 0:
+                self.get_logger().warn("No LiDAR points to process")
+                return
+                    
+            # Filter out points that are too far away
+            distances = np.sqrt(np.sum(lidar_data**2, axis=1))
+            
+            # Log distance information
+            min_dist = np.min(distances) if distances.size > 0 else float('inf')
+            max_dist = np.max(distances) if distances.size > 0 else 0
+            self.get_logger().info(f"LiDAR distance range: {min_dist:.2f}m to {max_dist:.2f}m")
+            
+            close_points_mask = distances < 50.0  # Filter to 50 meters
+            lidar_data = lidar_data[close_points_mask]
+            
+            # Transform points to world coordinates
+            points_world = transform_points(lidar_data, sensor_transform)
+            
+            # Accumulate points across multiple frames to increase density
+            with self.lidar_history_lock:
+                self.lidar_history.append(points_world)
+                if len(self.lidar_history) > self.accumulate_frames:
+                    self.lidar_history.pop(0)  # Remove oldest frame
+                
+                # Combine points from all frames in history
+                all_points = np.vstack(self.lidar_history)
+                
+                self.get_logger().info(f"Accumulated {len(all_points)} LiDAR points from {len(self.lidar_history)} frames")
+            
+            # Store for external use
+            self.latest_lidar_points = all_points
+            
+            # Log detection results
+            detected_cones = self.detect_cones_from_lidar(all_points)
+            self.get_logger().info(f"LiDAR detected {len(detected_cones)} cones")
+            
+            # Visualize detected cones
+            self.visualize_3d_cones(detected_cones)
+            
+            # Create PointCloud2 header
+            header = Header()
+            header.stamp = self.get_clock().now().to_msg()
+            header.frame_id = "map"
+            
+            # Create colored point cloud
+            fields = [
+                pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
+                pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
+                pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1),
+                pc2.PointField(name='intensity', offset=12, datatype=pc2.PointField.FLOAT32, count=1)
+            ]
+            
+            # Create structured array for colored points
+            structured_points = np.zeros(len(all_points), 
+                                        dtype=[
+                                            ('x', np.float32),
+                                            ('y', np.float32),
+                                            ('z', np.float32),
+                                            ('intensity', np.float32)
+                                        ])
+            
+            # Fill structured array
+            structured_points['x'] = all_points[:, 0]
+            structured_points['y'] = all_points[:, 1]
+            structured_points['z'] = all_points[:, 2]
+            
+            # Color points based on height (z value)
+            min_z = np.min(all_points[:, 2])
+            max_z = np.max(all_points[:, 2])
+            z_range = max_z - min_z
+            if z_range > 0:
+                intensity = (all_points[:, 2] - min_z) / z_range
+            else:
+                intensity = np.ones(len(all_points))
+            
+            structured_points['intensity'] = intensity
+            
+            # Create and publish the point cloud
+            pc_msg = pc2.create_cloud(header, fields, structured_points)
+            self.lidar_pub.publish(pc_msg)
+            
+        except Exception as e:
+            self.get_logger().error(f"Error processing LiDAR data: {str(e)}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
 
     def visualize_3d_cones(self, detected_cones):
         """
@@ -445,350 +817,6 @@ class LidarCameraFusionNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error visualizing cones: {str(e)}")
 
-    def process_lidar_data(self):
-        """Process and analyze LiDAR data with added diagnostics."""
-        if self.lidar is None or not hasattr(self, 'lidar_data') or self.lidar_data is None:
-            self.get_logger().warn("LiDAR data not available")
-            return
-            
-        try:
-            # Get sensor (LiDAR) world transformation matrix
-            sensor_transform = np.array(self.lidar.get_transform().get_matrix())
-            
-            # Transform LiDAR points from sensor to world coordinates
-            with self.lidar_lock:
-                lidar_data = self.lidar_data.copy()
-                point_count = len(lidar_data)
-            
-            # DIAGNOSTIC: Log basic LiDAR stats
-            self.get_logger().info(f"Processing {point_count} LiDAR points")
-            
-            if lidar_data.size == 0:
-                self.get_logger().warn("No LiDAR points to process")
-                return
-                    
-            # Filter out points that are too far away
-            distances = np.sqrt(np.sum(lidar_data**2, axis=1))
-            
-            # DIAGNOSTIC: Log distance information
-            min_dist = np.min(distances) if distances.size > 0 else float('inf')
-            max_dist = np.max(distances) if distances.size > 0 else 0
-            self.get_logger().info(f"LiDAR distance range: {min_dist:.2f}m to {max_dist:.2f}m")
-            
-            close_points_mask = distances < 50.0  # Filter to 50 meters
-            lidar_data = lidar_data[close_points_mask]
-            
-            # Transform points to world coordinates
-            points_world = transform_points(lidar_data, sensor_transform)
-            
-            # Accumulate points across multiple frames to increase density
-            with self.lidar_history_lock:
-                self.lidar_history.append(points_world)
-                if len(self.lidar_history) > self.accumulate_frames:
-                    self.lidar_history.pop(0)  # Remove oldest frame
-                
-                # Combine points from all frames in history
-                all_points = np.vstack(self.lidar_history)
-                
-                # DIAGNOSTIC: Log accumulated point count
-                self.get_logger().info(f"Accumulated {len(all_points)} LiDAR points from {len(self.lidar_history)} frames")
-            
-            # Store for external use
-            self.latest_lidar_points = all_points
-            
-            # Log basic information about points before detection
-            self.get_logger().info(f"Finding cones in LiDAR data: {len(all_points)} points")
-            
-            # Detect cones from LiDAR points
-            detected_cones = self.detect_cones_from_lidar(all_points)
-            
-            # Log detection results
-            self.get_logger().info(f"LiDAR detected {len(detected_cones)} cones")
-            for i, cone in enumerate(detected_cones):
-                pos = cone['position']
-                self.get_logger().info(f"  Cone {i+1}: Position=({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}), Conf={cone['confidence']:.2f}")
-            
-            # Analyze LiDAR for turn detection
-            self.analyze_lidar_for_turns(all_points, detected_cones)
-            
-            # Visualize detected cones
-            self.visualize_3d_cones(detected_cones)
-            
-            # Create PointCloud2 header
-            header = Header()
-            header.stamp = self.get_clock().now().to_msg()
-            header.frame_id = "map"  # Use map as frame to avoid tf issues
-            
-            # Create colored point cloud
-            fields = [
-                pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
-                pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
-                pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1),
-                pc2.PointField(name='intensity', offset=12, datatype=pc2.PointField.FLOAT32, count=1)
-            ]
-            
-            # Create structured array for colored points
-            structured_points = np.zeros(len(all_points), 
-                                        dtype=[
-                                            ('x', np.float32),
-                                            ('y', np.float32),
-                                            ('z', np.float32),
-                                            ('intensity', np.float32)
-                                        ])
-            
-            # Fill structured array
-            structured_points['x'] = all_points[:, 0]
-            structured_points['y'] = all_points[:, 1]
-            structured_points['z'] = all_points[:, 2]
-            
-            # Color points based on height (z value)
-            min_z = np.min(all_points[:, 2])
-            max_z = np.max(all_points[:, 2])
-            z_range = max_z - min_z
-            if z_range > 0:
-                intensity = (all_points[:, 2] - min_z) / z_range
-            else:
-                intensity = np.ones(len(all_points))
-            
-            structured_points['intensity'] = intensity
-            
-            # Create and publish the point cloud
-            pc_msg = pc2.create_cloud(header, fields, structured_points)
-            self.lidar_pub.publish(pc_msg)
-            
-        except Exception as e:
-            self.get_logger().error(f"Error processing LiDAR data: {str(e)}")
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-
-    def analyze_lidar_for_turns(self, points, detected_cones):
-        """Analyze LiDAR point cloud and detected cones to detect upcoming turns."""
-        try:
-            # Initialize turn information
-            self.lidar_right_turn_detected = False
-            self.lidar_left_turn_detected = False
-            self.lidar_turn_distance = float('inf')
-            self.lidar_turn_confidence = 0.0
-            
-            # Use detected cones if available, otherwise use clustering approach
-            if detected_cones and len(detected_cones) >= 3:
-                self.get_logger().info("Using detected cones for turn analysis")
-                
-                # Extract cone positions
-                cone_positions = [cone['position'] for cone in detected_cones]
-                
-                # Simple approach: Look for significant lateral deviation in the cone pattern
-                cone_positions.sort(key=lambda p: p[1])  # Sort by Y distance (forward)
-                
-                # Analyze lateral position trend
-                x_positions = [p[0] for p in cone_positions]
-                
-                # If we have enough cones, try to detect a pattern
-                if len(x_positions) >= 4:
-                    # Simple trend analysis: are right side points moving left (right turn) or
-                    # left side points moving right (left turn)?
-                    
-                    # Divide into near and far points
-                    mid_idx = len(x_positions) // 2
-                    near_avg_x = sum(x_positions[:mid_idx]) / mid_idx
-                    far_avg_x = sum(x_positions[mid_idx:]) / (len(x_positions) - mid_idx)
-                    
-                    # Check for significant lateral shift
-                    lateral_shift = far_avg_x - near_avg_x
-                    
-                    # DIAGNOSTIC
-                    self.get_logger().info(f"Cone lateral shift analysis: near_avg_x={near_avg_x:.2f}, far_avg_x={far_avg_x:.2f}, shift={lateral_shift:.2f}")
-                    
-                    if lateral_shift < -0.3:  # Right turn
-                        self.lidar_right_turn_detected = True
-                        self.lidar_turn_distance = far_centers[0][0]  # Distance to start of far segment
-                        self.lidar_turn_confidence = min(1.0, abs(lateral_shift) / 1.0)
-                        self.get_logger().warn(f"LiDAR detected RIGHT TURN at {self.lidar_turn_distance:.2f}m (shift: {lateral_shift:.2f})")
-                        
-                    elif lateral_shift > 0.3:  # Left turn
-                        self.lidar_left_turn_detected = True
-                        self.lidar_turn_distance = far_centers[0][0]  # Distance to start of far segment
-                        self.lidar_turn_confidence = min(1.0, abs(lateral_shift) / 1.0)
-                        self.get_logger().warn(f"LiDAR detected LEFT TURN at {self.lidar_turn_distance:.2f}m (shift: {lateral_shift:.2f})")
-            
-            # If no cones detected or not enough, use point cloud analysis
-            else:
-                self.get_logger().info("Not enough cones detected, using point cloud analysis")
-                
-                # Filter to points likely to be cones (above ground, below certain height)
-                cone_height_min = 0.05  # 5cm above ground
-                cone_height_max = 0.5   # 50cm tall (typical cone height)
-                potential_cone_points = [p for p in points if cone_height_min < p[2] < cone_height_max]
-                
-                # DIAGNOSTIC
-                self.get_logger().info(f"Found {len(potential_cone_points)} potential cone points in height range")
-                
-                if len(potential_cone_points) < 10:
-                    self.get_logger().warn("Not enough potential cone points for analysis")
-                    return
-                
-                # Simple approach: analyze the X distribution of points at different depths
-                points_by_depth = {}
-                depth_interval = 2.0  # Group points in 2m intervals
-                
-                for point in potential_cone_points:
-                    depth_bin = int(point[1] / depth_interval) * depth_interval
-                    if depth_bin not in points_by_depth:
-                        points_by_depth[depth_bin] = []
-                    points_by_depth[depth_bin].append(point)
-                
-                # Sort depth bins
-                sorted_depths = sorted(points_by_depth.keys())
-                
-                # DIAGNOSTIC
-                self.get_logger().info(f"Point depth distribution: {', '.join([f'{d}m:{len(points_by_depth[d])}' for d in sorted_depths])}")
-                
-                # Need at least 3 depth bins for trend analysis
-                if len(sorted_depths) >= 3:
-                    # Calculate average X position at each depth
-                    avg_x_by_depth = {d: sum(p[0] for p in points_by_depth[d]) / len(points_by_depth[d]) for d in sorted_depths}
-                    
-                    # Check for consistent lateral shift trend
-                    x_shifts = []
-                    for i in range(1, len(sorted_depths)):
-                        prev_depth = sorted_depths[i-1]
-                        curr_depth = sorted_depths[i]
-                        x_shift = avg_x_by_depth[curr_depth] - avg_x_by_depth[prev_depth]
-                        x_shifts.append(x_shift)
-                    
-                    # If consistent trend detected
-                    if len(x_shifts) >= 2:
-                        avg_shift = sum(x_shifts) / len(x_shifts)
-                        
-                        # DIAGNOSTIC
-                        self.get_logger().info(f"Average X shift per depth interval: {avg_shift:.3f}m")
-                        
-                        if avg_shift < -0.2:  # Consistent shift right to left = right turn
-                            self.lidar_right_turn_detected = True
-                            self.lidar_turn_distance = sorted_depths[1]  # Use second depth bin as turn distance
-                            self.lidar_turn_confidence = min(1.0, abs(avg_shift) / 0.5)
-                            self.get_logger().warn(f"LiDAR point cloud analysis: RIGHT TURN at {self.lidar_turn_distance:.1f}m (shift: {avg_shift:.2f})")
-                            
-                        elif avg_shift > 0.2:  # Consistent shift left to right = left turn
-                            self.lidar_left_turn_detected = True
-                            self.lidar_turn_distance = sorted_depths[1]
-                            self.lidar_turn_confidence = min(1.0, abs(avg_shift) / 0.5)
-                            self.get_logger().warn(f"LiDAR point cloud analysis: LEFT TURN at {self.lidar_turn_distance:.1f}m (shift: {avg_shift:.2f})")
-                    
-            # Return results for use in control logic
-            return {
-                'right_turn': self.lidar_right_turn_detected,
-                'left_turn': self.lidar_left_turn_detected,
-                'distance': self.lidar_turn_distance,
-                'confidence': self.lidar_turn_confidence
-            }
-            
-        except Exception as e:
-            self.get_logger().error(f"Error analyzing LiDAR for turns: {str(e)}")
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-            return None
-
-    def fuse_data(self):
-        """Fuse LiDAR and camera data."""
-        if self.zed_camera is None or self.zed_camera.rgb_image is None or self.zed_camera.depth_image is None:
-            return
-            
-        if self.lidar_data is None:
-            return
-            
-        try:
-            # Get depth image
-            depth_array, _ = self.zed_camera.depth_image
-            
-            # Project LiDAR points to camera image
-            lidar_transform = np.array(self.lidar.get_transform().get_matrix())
-            camera_transform = np.array(self.zed_camera.rgb_sensor.get_transform().get_matrix())
-            
-            # Calculate relative transform from LiDAR to camera
-            lidar_to_camera = np.linalg.inv(camera_transform) @ lidar_transform
-            
-            # Copy LiDAR data to avoid race conditions
-            with self.lidar_lock:
-                lidar_data = self.lidar_data.copy()
-            
-            # Transform LiDAR points to camera frame
-            points_camera_frame = transform_points(lidar_data, lidar_to_camera)
-            
-            # Simple data fusion: Filter LiDAR points by camera FOV and depth
-            # This is a basic fusion - more sophisticated methods can be implemented
-            valid_points = []
-            colors = []
-            
-            for i, point in enumerate(points_camera_frame):
-                # Only keep points in front of camera
-                if point[2] <= 0:
-                    continue
-                    
-                # Project point to image
-                x, y, z = point
-                
-                # Basic pinhole camera model (approximation)
-                # This should be replaced with proper camera calibration parameters
-                fx = 800.0  # focal length x
-                fy = 800.0  # focal length y
-                cx = 640.0  # optical center x
-                cy = 360.0  # optical center y
-                
-                u = int(fx * x / z + cx)
-                v = int(fy * y / z + cy)
-                
-                # Check if point projects into image
-                if (0 <= u < 1280 and 0 <= v < 720):
-                    # Get depth from depth image at projected point
-                    if depth_array is not None:
-                        camera_depth = depth_array[v, u] if v < depth_array.shape[0] and u < depth_array.shape[1] else 0
-                        
-                        # Compare LiDAR depth with camera depth
-                        lidar_depth = np.abs(z)
-                        
-                        # If depths are similar, consider it a valid fusion point
-                        if camera_depth > 0 and abs(lidar_depth - camera_depth) < 2.0:
-                            valid_points.append(point)
-                            
-                            # Get color from RGB image
-                            if self.zed_camera.rgb_image is not None:
-                                r, g, b = self.zed_camera.rgb_image[v, u]
-                                colors.append([r/255.0, g/255.0, b/255.0])
-                            else:
-                                colors.append([1.0, 1.0, 1.0])  # White if no color available
-            
-            # Create fused colored point cloud
-            if valid_points:
-                fused_points = np.array(valid_points)
-                
-                # Transform back to world frame
-                fused_points_world = transform_points(fused_points, camera_transform)
-                
-                # Create PointCloud2 message for fused points
-                header = Header()
-                header.stamp = self.get_clock().now().to_msg()
-                header.frame_id = "map"
-                
-                # Publisher requires a structured point cloud with fields
-                # We'll create an uncolored point cloud for simplicity
-                pc_msg = pc2.create_cloud_xyz32(header, fused_points_world)
-                self.fused_pub.publish(pc_msg)
-                
-                # For colored point cloud:
-                # fields = [PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-                #          PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-                #          PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-                #          PointField(name='r', offset=12, datatype=PointField.FLOAT32, count=1),
-                #          PointField(name='g', offset=16, datatype=PointField.FLOAT32, count=1),
-                #          PointField(name='b', offset=20, datatype=PointField.FLOAT32, count=1)]
-                
-                self.get_logger().debug(f"Published {len(valid_points)} fused points")
-        except Exception as e:
-            self.get_logger().error(f"Error in data fusion: {str(e)}")
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-    
     def publish_data(self):
         """Publish camera and path planning data."""
         if (self.zed_camera is None or 
@@ -865,6 +893,17 @@ class LidarCameraFusionNode(Node):
             # Broadcast the transform
             self.tf_broadcaster.sendTransform(t)
             
+            # Store vehicle pose for mapping
+            self.vehicle_poses.append((
+                vehicle_transform.location.x,
+                vehicle_transform.location.y,
+                vehicle_transform.rotation.yaw
+            ))
+            
+            # Limit stored poses to last 1000
+            if len(self.vehicle_poses) > 1000:
+                self.vehicle_poses = self.vehicle_poses[-1000:]
+            
         except Exception as e:
             self.get_logger().error(f"Error broadcasting transforms: {str(e)}")
     
@@ -878,6 +917,11 @@ class LidarCameraFusionNode(Node):
                     
                     # Show RGB image with detections
                     cv2.imshow('RGB Image with Detections', self.zed_camera.rgb_image)
+                    
+                    # Show path visualization if available
+                    if self.path_planner and hasattr(self.path_planner, 'path') and self.path_planner.path:
+                        path_img = self.path_planner.draw_path(self.zed_camera.rgb_image.copy())
+                        cv2.imshow('Pure Pursuit Path', path_img)
                     
                     # Show depth image if available
                     if (hasattr(self.zed_camera, 'depth_image') and 
@@ -948,8 +992,7 @@ class LidarCameraFusionNode(Node):
             path_msg.header.stamp = self.get_clock().now().to_msg()
             
             # Convert vehicle's yaw to rotation matrix
-            # Subtract 90 degrees (π/2) to rotate the path to the right
-            yaw = np.radians(vehicle_rotation.yaw )
+            yaw = np.radians(vehicle_rotation.yaw)
             rotation_matrix = np.array([
                 [np.cos(yaw), -np.sin(yaw)],
                 [np.sin(yaw), np.cos(yaw)]
@@ -957,9 +1000,8 @@ class LidarCameraFusionNode(Node):
             
             # Convert path points to PoseStamped messages
             for point in path:
-                # Swap and invert coordinates to fix orientation
-                # Original path point is (x forward, y left) in vehicle frame
-                # We want (x right, y forward) in world frame
+                # In pure pursuit, path is in (lateral, forward) coordinates
+                # Convert to (forward, lateral) for vehicle frame
                 local_point = np.array([point[1], point[0]])  # Swap coordinates
                 world_point = rotation_matrix @ local_point
                 
@@ -969,12 +1011,12 @@ class LidarCameraFusionNode(Node):
                 pose.pose.position.y = vehicle_location.y + world_point[1]
                 pose.pose.position.z = vehicle_location.z  # Keep same height as vehicle
                 
-                # Calculate orientation tangent to the path
+                # Set orientation tangent to the path
                 if len(path_msg.poses) > 0:
                     # Get direction to next point
                     dx = world_point[0]
                     dy = world_point[1]
-                    heading = np.arctan2(dy, dx)  # Use world frame heading directly
+                    heading = np.arctan2(dy, dx)
                     
                     # Convert to quaternion
                     qw = np.cos(heading / 2)
@@ -1000,9 +1042,166 @@ class LidarCameraFusionNode(Node):
             import traceback
             self.get_logger().error(traceback.format_exc())
 
+    def control_car(self):
+        """Control the car using pure pursuit steering and adaptive speed with improved cone avoidance."""
+        if not hasattr(self, 'path_planner') or self.path_planner is None:
+            # Fail-safe: if no path planner, move forward with small steering
+            self.get_logger().warn("No path planner available! Using fail-safe control!")
+            self.set_car_controls(0.0, 3.0)  # Move forward with no steering at higher speed
+            return
+        
+        try:
+            # Get current speed
+            current_speed = 0.0
+            if hasattr(self, 'vehicle') and self.vehicle:
+                velocity = self.vehicle.get_velocity()
+                current_speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+                
+            # HIGHER SPEED LIMIT - Increased from 8.0 to 12.0 m/s (about 27 mph)
+            if current_speed > 12.0:
+                # Apply brakes to slow down
+                import carla
+                self.get_logger().warn(f"OVER SPEED LIMIT! Current: {current_speed:.2f} m/s - applying brakes")
+                
+                # Create control command with braking
+                control = carla.VehicleControl()
+                control.throttle = 0.0
+                control.brake = 0.4  # Strong braking
+                control.steer = self.prev_steering if hasattr(self, 'prev_steering') else 0.0
+                control.reverse = False
+                
+                # Apply control
+                self.vehicle.apply_control(control)
+                # Force physics update
+                self.world.tick()
+                
+                return
+                
+            # Check if we have a valid path
+            if not self.path_planner.path or len(self.path_planner.path) < 2:
+                # No valid path - move forward with minimal steering
+                self.get_logger().warn("No valid path! Moving forward...")
+                self.set_car_controls(0.0, 3.0)  # Increased from 1.5 to 3.0
+                return
+                
+            # Get steering angle from pure pursuit planner
+            lookahead = max(3.0, min(7.0, current_speed * 0.8))  # Increased adaptive lookahead for stability at higher speeds
+            steering = self.path_planner.calculate_steering(lookahead_distance=lookahead)
+            
+            # Limit steering angle based on speed to prevent tipping 
+            max_steering = 1.0
+            if current_speed > 5.0:  # Adjusted threshold
+                max_steering = 0.8
+            elif current_speed > 8.0:  # Adjusted threshold
+                max_steering = 0.6
+                
+            steering = np.clip(steering, -max_steering, max_steering)
+            
+            # FASTER SPEED CONTROL - Increased all speeds
+            base_speed = 6.0   # Increased from 3.0 to 6.0 m/s (about 13.4 mph)
+            turn_speed = 3.5   # Increased from 1.5 to 3.5 m/s (about 7.8 mph)
+            sharp_turn_speed = 2.0  # Increased from 0.8 to 2.0 m/s (about 4.5 mph)
+            
+            # Default to base speed
+            target_speed = base_speed
+            
+            # IMPROVED TURN HANDLING: Determine target speed based on steering magnitude
+            steering_magnitude = abs(steering)
+            if steering_magnitude > 0.7:  # Very sharp turn
+                target_speed = sharp_turn_speed
+                self.get_logger().warn(f"SHARP TURN detected! Slowing to {target_speed:.2f}m/s")
+            elif steering_magnitude > 0.3:  # Moderate turn
+                target_speed = turn_speed
+                self.get_logger().warn(f"Turn detected! Slowing to {target_speed:.2f}m/s")
+            
+            # ENHANCED CONE AVOIDANCE - detect cones earlier and slow down more aggressively
+            cone_in_path = False
+            closest_cone_dist = float('inf')
+            
+            if hasattr(self.zed_camera, 'cone_detections'):
+                for cone in self.zed_camera.cone_detections:
+                    if 'depth' not in cone:
+                        continue
+                        
+                    depth = cone['depth']
+                    # Keep track of closest cone regardless of whether it's in path
+                    if depth < closest_cone_dist:
+                        closest_cone_dist = depth
+                    
+                    # Check if cone is in path - wider detection corridor for earlier avoidance
+                    if 'box' in cone:
+                        x1, y1, x2, y2 = cone['box']
+                        center_x = (x1 + x2) // 2
+                        image_center_x = self.zed_camera.resolution[0] // 2
+                        
+                        # WIDER detection corridor based on distance - more conservative
+                        center_threshold = 350 - (200 * min(1.0, depth / 15.0))
+                        
+                        # Check if cone is in path
+                        if abs(center_x - image_center_x) < center_threshold:
+                            cone_in_path = True
+                            self.get_logger().warn(f"Cone detected in path at {depth:.2f}m (offset: {abs(center_x - image_center_x)}px)")
+                
+                # IMPROVED CONE AVOIDANCE BEHAVIOR
+                if cone_in_path:
+                    # Calculate safe speed based on distance to cone
+                    # Start slowing down earlier (10m instead of 5m)
+                    if closest_cone_dist < 10.0:
+                        # More aggressive slowdown curve with distance
+                        # At 10m -> 75% of base speed
+                        # At 5m -> 40% of base speed 
+                        # At 3m -> 25% of base speed
+                        # At 1m -> 10% of base speed
+                        cone_factor = min(1.0, max(0.1, closest_cone_dist / 10.0))
+                        
+                        # Exponential slowdown (more aggressive than linear)
+                        cone_speed = base_speed * (cone_factor * cone_factor)
+                        
+                        if cone_speed < target_speed:
+                            target_speed = cone_speed
+                            self.get_logger().warn(f"CONE AVOIDANCE: Slowing to {target_speed:.2f}m/s at {closest_cone_dist:.2f}m distance")
+                
+                # Additional safety: emergency stop if very close to any cone (regardless of path)
+                if closest_cone_dist < 1.0:
+                    target_speed = 0.0  # Stop completely
+                    self.get_logger().error(f"EMERGENCY STOP! Cone extremely close: {closest_cone_dist:.2f}m")
+            
+            # Apply gradual acceleration/deceleration
+            if hasattr(self, 'prev_target_speed'):
+                # More responsive speed adaptation
+                max_accel = 0.4  # Increased from 0.2 to 0.4 m/s² - faster acceleration
+                max_decel = 0.7  # Increased from 0.5 to 0.7 m/s² - stronger deceleration for better safety
+                
+                if target_speed > self.prev_target_speed:
+                    # Accelerating
+                    target_speed = min(target_speed, self.prev_target_speed + max_accel)
+                else:
+                    # Decelerating - respond quickly to obstacles and turns
+                    target_speed = max(target_speed, self.prev_target_speed - max_decel)
+            
+            # Update for next iteration
+            self.prev_target_speed = target_speed
+            self.prev_steering = steering
+            
+            # Apply control to vehicle
+            self.set_car_controls(steering, target_speed)
+            
+            # Log control decision
+            self.get_logger().info(f"Pure pursuit control: steering={steering:.2f}, speed={target_speed:.2f}m/s")
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in car control: {str(e)}")
+            # Safety fallback
+            self.set_car_controls(0.0, 2.0)  # Increased from 1.0 to 2.0 m/s (about 4.5 mph)
+            import traceback
+    
     def set_car_controls(self, steering, speed):
         """
-        Set the car's steering and speed with guaranteed movement.
+        Set the car's steering and speed with improved braking for obstacles.
+        
+        Args:
+            steering: Steering angle in range [-1, 1]
+            speed: Target speed in m/s (positive for forward, negative for reverse)
         """
         if self.vehicle is None:
             self.get_logger().error("Cannot set controls: No vehicle available")
@@ -1011,8 +1210,9 @@ class LidarCameraFusionNode(Node):
         try:
             import carla
             
-            # Ensure minimum throttle to guarantee movement
-            min_throttle = 0.3  # Minimum throttle to ensure movement
+            # Get current speed for better control
+            velocity = self.vehicle.get_velocity()
+            current_speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
             
             # Create control command
             control = carla.VehicleControl()
@@ -1020,22 +1220,58 @@ class LidarCameraFusionNode(Node):
             # Set steering (-1 to 1)
             control.steer = float(steering)
             
-            # Set throttle and brake based on speed
-            if speed >= 0:
-                # Forward - ensure minimum throttle
-                control.throttle = max(min_throttle, min(abs(speed) / 5.0, 1.0))
-                control.brake = 0.0
-                control.reverse = False
-            else:
-                # Reverse
+            # Determine if we need to accelerate, maintain speed, or brake
+            if speed > 0:  # Forward motion
+                # Check if we need emergency braking (going much faster than target)
+                if speed < 0.5 and current_speed > 2.0:  # Hard stop requested while moving fast
+                    # Emergency braking
+                    control.throttle = 0.0
+                    control.brake = 0.8  # Strong braking
+                    control.reverse = False
+                    self.get_logger().error(f"EMERGENCY BRAKING: Current speed {current_speed:.2f} with target {speed:.2f}")
+                # Check if we need to slow down
+                elif current_speed > speed + 0.5:  # If going more than 0.5 m/s too fast
+                    # Apply brakes - stronger braking for higher overspeeds
+                    speed_diff = current_speed - speed
+                    brake_force = min(0.7, max(0.2, speed_diff * 0.3))  # Scale brake force with speed difference
+                    
+                    control.throttle = 0.0
+                    control.brake = brake_force
+                    control.reverse = False
+                    
+                    self.get_logger().warn(f"BRAKING: Current {current_speed:.2f} > target {speed:.2f}, brake={brake_force:.2f}")
+                else:
+                    # Normal forward throttle - proportional to desired speed
+                    min_throttle = 0.4   # Increased from 0.3 to 0.4 - higher minimum throttle to ensure movement
+                    max_throttle = 1.0   # Increased from 0.9 to 1.0 - maximum throttle for better acceleration
+                    
+                    # Progressive throttle control
+                    if current_speed < speed - 0.5:  # Need substantial acceleration
+                        # Stronger throttle when far from target speed
+                        speed_diff = min(5.0, speed - current_speed)  # Cap to avoid excessive values
+                        throttle = min(max_throttle, min_throttle + speed_diff * 0.2)  # Increased multiplier from 0.15 to 0.2
+                    elif current_speed < speed - 0.1:  # Need minor acceleration
+                        throttle = min_throttle + 0.15  # Increased from 0.1 to 0.15 - slight boost
+                    else:  # At or near target speed
+                        throttle = min_throttle
+                    
+                    control.throttle = throttle
+                    control.brake = 0.0
+                    control.reverse = False
+                    
+                    self.get_logger().info(f"Throttle: {control.throttle:.2f} for speed={speed:.2f}m/s (current: {current_speed:.2f})")
+            else:  # Zero or negative speed - stop
                 control.throttle = 0.0
-                control.brake = min(abs(speed) / 5.0, 1.0)
-                control.reverse = True
+                # Apply brakes harder if moving faster
+                control.brake = min(0.9, max(0.4, current_speed * 0.2))  # Scale with current speed
+                control.reverse = False
+                
+                self.get_logger().warn(f"Stopping vehicle with brake={control.brake:.2f}")
             
             # Apply control to vehicle
             self.vehicle.apply_control(control)
             
-            # Force a physics update to ensure movement
+            # FORCE PHYSICS UPDATE FOR IMMEDIATE MOVEMENT
             self.world.tick()
             
             # Log that control was applied
@@ -1047,231 +1283,6 @@ class LidarCameraFusionNode(Node):
             self.get_logger().error(f"Error setting car controls: {str(e)}")
             import traceback
             self.get_logger().error(traceback.format_exc())
-
-    def detect_turns_with_lidar(self):
-        """Use LiDAR point cloud to detect both upcoming right and left turns, with enhanced U-turn detection."""
-        # Initialize defaults
-        right_turn_detected = False
-        left_turn_detected = False
-        uturn_detected = False
-        turn_distance = float('inf')
-        
-        try:
-            # Get the latest LiDAR points
-            if not hasattr(self, 'lidar_history') or not self.lidar_history:
-                self.get_logger().warn("No LiDAR history available")
-                return right_turn_detected, left_turn_detected, turn_distance
-                
-            with self.lidar_history_lock:
-                if not self.lidar_history:
-                    return right_turn_detected, left_turn_detected, turn_distance
-                
-                # Combine points from all frames in history for better coverage
-                all_points = np.vstack(self.lidar_history)
-            
-            if len(all_points) < 100:
-                self.get_logger().warn(f"Not enough LiDAR points for analysis: {len(all_points)}")
-                return right_turn_detected, left_turn_detected, turn_distance
-                
-            # Enhanced filtering for better cone and boundary detection
-            height_min = 0.05  # 5cm off ground
-            height_max = 0.6   # Increased height range to catch more potential cones
-            distance_max = 40.0  # Extended range for earlier detection
-            
-            # Calculate distances
-            distances = np.sqrt(np.sum(all_points[:, :2]**2, axis=1))
-            
-            # Apply enhanced filters
-            mask = ((all_points[:, 2] >= height_min) & 
-                    (all_points[:, 2] <= height_max) & 
-                    (distances <= distance_max))
-            filtered_points = all_points[mask]
-            
-            if len(filtered_points) < 50:
-                self.get_logger().warn(f"Not enough filtered LiDAR points: {len(filtered_points)}")
-                return right_turn_detected, left_turn_detected, turn_distance
-                
-            # Create more detailed distance bins for better analysis
-            bin_size = 1.0  # Reduced for finer granularity
-            max_distance = 40.0  # Extended range
-            num_bins = int(max_distance / bin_size)
-            
-            # Initialize bin data with angle information
-            angle_bins = np.linspace(-np.pi/2, np.pi/2, 20)  # More angle bins for better resolution
-            point_distribution = np.zeros((num_bins, len(angle_bins)-1))
-            
-            # Analyze point distribution in polar coordinates
-            for point in filtered_points:
-                x, y = point[0], point[1]
-                distance = np.sqrt(x**2 + y**2)
-                angle = np.arctan2(x, y)  # Angle from forward direction
-                
-                # Find appropriate bins
-                dist_bin = min(int(distance / bin_size), num_bins - 1)
-                angle_bin = np.digitize(angle, angle_bins) - 1
-                
-                if 0 <= angle_bin < len(angle_bins)-1:
-                    point_distribution[dist_bin, angle_bin] += 1
-            
-            # Look for trends in point distribution that indicate turns
-            # Focus on bins from 5m to 25m - the critical area for planning
-            start_bin = 5
-            end_bin = min(25, num_bins-1)
-            
-            # Calculate lateral center of mass for each distance bin
-            lateral_centers = []
-            for d in range(start_bin, end_bin):
-                if np.sum(point_distribution[d]) > 10:  # Only consider bins with enough points
-                    # Calculate weighted average angle
-                    weighted_sum = 0
-                    total_weight = 0
-                    for a in range(len(angle_bins)-1):
-                        angle_center = (angle_bins[a] + angle_bins[a+1]) / 2
-                        weighted_sum += angle_center * point_distribution[d, a]
-                        total_weight += point_distribution[d, a]
-                    
-                    if total_weight > 0:
-                        lateral_centers.append((d * bin_size, weighted_sum / total_weight))
-            
-            # If we have enough data points, detect trends
-            if len(lateral_centers) >= 5:
-                # Split into near and far segments
-                mid_idx = len(lateral_centers) // 2
-                near_centers = lateral_centers[:mid_idx]
-                far_centers = lateral_centers[mid_idx:]
-                
-                # Calculate averages for each segment
-                near_avg = sum(angle for _, angle in near_centers) / len(near_centers)
-                far_avg = sum(angle for _, angle in far_centers) / len(far_centers)
-                
-                # Calculate trend (change in lateral position)
-                lateral_shift = far_avg - near_avg
-                
-                # Set detection thresholds
-                turn_threshold = 0.15  # Lowered threshold for earlier detection
-                
-                # Determine turn direction and distance
-                if lateral_shift < -turn_threshold:  # Shifting right
-                    right_turn_detected = True
-                    left_turn_detected = False
-                    turn_distance = far_centers[0][0]  # Distance to start of far segment
-                    self.get_logger().info(f"LiDAR detected RIGHT TURN at {turn_distance:.1f}m (shift: {lateral_shift:.3f})")
-                elif lateral_shift > turn_threshold:  # Shifting left
-                    left_turn_detected = True
-                    right_turn_detected = False
-                    turn_distance = far_centers[0][0]  # Distance to start of far segment
-                    self.get_logger().info(f"LiDAR detected LEFT TURN at {turn_distance:.1f}m (shift: {lateral_shift:.3f})")
-            
-            # U-turn detection (preserving existing functionality)
-            uturn_score = 0
-            uturn_distance = float('inf')
-            
-            # Look for sharp changes in point distribution that indicate U-turns
-            for d in range(2, num_bins-2):
-                near_dist = d * bin_size
-                
-                # Calculate left-right ratio for consecutive distance bins
-                left_points = np.sum(point_distribution[d, :8])  # Left side
-                right_points = np.sum(point_distribution[d, 9:])  # Right side
-                next_left = np.sum(point_distribution[d+1, :8])
-                next_right = np.sum(point_distribution[d+1, 9:])
-                
-                # Look for characteristic U-turn pattern
-                forward_points = np.sum(point_distribution[d, 8:10])
-                next_forward = np.sum(point_distribution[d+1, 8:10])
-                
-                if forward_points > 10 and next_forward < forward_points * 0.3:
-                    # Sharp decrease in forward points
-                    side_concentration = max(left_points, right_points) / (forward_points + 1)
-                    distribution_change = abs((left_points/right_points if right_points > 0 else 10) - 
-                                           (next_left/next_right if next_right > 0 else 10))
-                    
-                    current_score = side_concentration * distribution_change
-                    if current_score > uturn_score:
-                        uturn_score = current_score
-                        uturn_distance = near_dist
-                        
-                        # Determine turn direction based on point concentration
-                        if left_points > right_points:
-                            left_turn_detected = True
-                            right_turn_detected = False
-                        else:
-                            right_turn_detected = True
-                            left_turn_detected = False
-            
-            # U-turn detection threshold
-            if uturn_score > 2.0:
-                uturn_detected = True
-                turn_distance = uturn_distance
-                self.get_logger().warn(f"U-TURN detected at {turn_distance:.1f}m (score: {uturn_score:.2f})")
-                
-                # Store U-turn state for path planning
-                self.uturn_state = {
-                    'detected': True,
-                    'distance': turn_distance,
-                    'score': uturn_score,
-                    'direction': 'left' if left_turn_detected else 'right'
-                }
-            
-            return right_turn_detected, left_turn_detected, turn_distance
-            
-        except Exception as e:
-            self.get_logger().error(f"Error detecting turns with LiDAR: {str(e)}")
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-            return False, False, float('inf')
-
-    def control_car(self):
-        """Control the car with enhanced LiDAR turn detection for both left and right turns."""
-        if not hasattr(self, 'path_planner') or self.path_planner is None:
-            self.set_car_controls(0.0, 1.0)
-            return
-        
-        # Get steering from path planner
-        steering = self.path_planner.calculate_steering(lookahead_distance=2.5)
-        
-        # Use enhanced LiDAR to detect turns - now detects both left and right turns earlier
-        lidar_right_turn, lidar_left_turn, lidar_turn_distance = self.detect_turns_with_lidar()
-        
-        # Speed parameters - slightly more conservative
-        max_speed = 1.5  # Reduced overall speed for better control
-        turn_speed = 0.6
-        slow_speed = 0.3
-        
-        # Default speeds
-        target_speed = max_speed
-        speed_reason = "Normal driving"
-        
-        # LIDAR-DETECTED TURNS - Highest priority and more aggressive slowdown
-        if lidar_right_turn or lidar_left_turn:
-            # More aggressive slowdown that starts earlier
-            # The earlier we detect the turn, the more gradually we can slow down
-            turn_type = "RIGHT" if lidar_right_turn else "LEFT"
-            
-            # Start slowing down more aggressively and from further away
-            if lidar_turn_distance < 20.0:
-                # Exponential slowdown based on distance
-                slowdown_factor = np.exp(-(lidar_turn_distance/10.0))
-                lidar_turn_speed = max_speed * (1.0 - slowdown_factor*0.9)
-                
-                # Cap maximum speed in turns
-                if lidar_turn_distance < 10.0:
-                    lidar_turn_speed = min(lidar_turn_speed, turn_speed)
-                if lidar_turn_distance < 5.0:
-                    lidar_turn_speed = min(lidar_turn_speed, slow_speed)
-                
-                if lidar_turn_speed < target_speed:
-                    target_speed = lidar_turn_speed
-                    speed_reason = f"LIDAR {turn_type} TURN at {lidar_turn_distance:.1f}m"
-        
-        # Rest of your existing control logic here...
-        
-        # Store for next iteration
-        self.prev_target_speed = target_speed
-        self.prev_steering = steering
-        
-        # Apply control to vehicle with potentially modified target_speed
-        self.set_car_controls(steering, target_speed)
 
     def update_and_publish_metrics(self, control_latency, current_speed, target_speed):
         """Update and publish performance metrics for RViz visualization."""
@@ -1366,757 +1377,102 @@ class LidarCameraFusionNode(Node):
             self.get_logger().error(f"Error publishing metrics: {str(e)}")
 
     def visualize_detected_cones(self):
-        """Visualize detected cones in RViz."""
+        """Visualize cone detections in RViz."""
         try:
-            # Check if we have cone detections
-            cones_to_visualize = []
-            
-            # Get cones from camera
-            if hasattr(self, 'zed_camera') and self.zed_camera and hasattr(self.zed_camera, 'cone_detections'):
-                cam_cones = self.zed_camera.cone_detections
-                for cone in cam_cones:
-                    if 'depth' in cone and 'box' in cone:
-                        depth = cone['depth']
-                        
-                        if depth < closest_cone_dist:
-                            closest_cone_dist = depth
-                        
-                        # Check if cone is in path with wider threshold
-                        x1, y1, x2, y2 = cone['box']
-                        center_x = (x1 + x2) // 2
-                        image_center_x = self.zed_camera.resolution[0] // 2
-                        
-                        # Even wider detection corridor
-                        center_threshold = 550 - (450 * min(1.0, depth / 15.0))
-                        
-                        if abs(center_x - image_center_x) < center_threshold:
-                            cone_in_path = True
-                            self.get_logger().warn(f"CONE IN PATH at {depth:.2f}m! Center offset: {abs(center_x - image_center_x)}px")
-            
-            # Rest of your existing visualization logic here...
-            
-        except Exception as e:
-            self.get_logger().error(f"Error visualizing cones: {str(e)}")
-
-    def visualize_pcd_data(self):
-        """Visualize current PCD data in RViz."""
-        try:
-            if not hasattr(self, 'latest_lidar_points') or self.latest_lidar_points is None:
-                return
-            
-            # Create PointCloud2 message
-            header = Header()
-            header.stamp = self.get_clock().now().to_msg()
-            header.frame_id = "map"
-            
-            # Create fields for the point cloud
-            fields = [
-                pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
-                pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
-                pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1),
-                pc2.PointField(name='intensity', offset=12, datatype=pc2.PointField.FLOAT32, count=1)
-            ]
-            
-            # Color points based on height
-            points = self.latest_lidar_points
-            min_z = np.min(points[:, 2])
-            max_z = np.max(points[:, 2])
-            z_range = max_z - min_z if max_z > min_z else 1.0
-            
-            # Create structured array for colored points
-            structured_points = np.zeros(len(points), 
-                                        dtype=[
-                                            ('x', np.float32),
-                                            ('y', np.float32),
-                                            ('z', np.float32),
-                                            ('intensity', np.float32)
-                                        ])
-            
-            # Fill structured array
-            structured_points['x'] = points[:, 0]
-            structured_points['y'] = points[:, 1]
-            structured_points['z'] = points[:, 2]
-            
-            # Color points based on height (z value)
-            intensity = (points[:, 2] - min_z) / z_range
-            structured_points['intensity'] = intensity
-            
-            # Create and publish the point cloud
-            pc_msg = pc2.create_cloud(header, fields, structured_points)
-            
-            if not hasattr(self, 'pcd_pub'):
-                self.pcd_pub = self.create_publisher(PointCloud2, '/carla/pcd_visualization', 10)
-            
-            self.pcd_pub.publish(pc_msg)
-            
-        except Exception as e:
-            self.get_logger().error(f"Error visualizing PCD data: {str(e)}")
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-
-    def update_pcd_file_list(self):
-        """Update the list of available PCD files."""
-        try:
-            if not hasattr(self, 'output_dir') or not os.path.exists(self.output_dir):
-                return
-                
-            # Get list of PCD files
-            pcd_files = [f for f in os.listdir(self.output_dir) if f.endswith('.pcd')]
-            pcd_files.sort()  # Sort by name
-            
-            # Store the list
-            self.pcd_files = pcd_files
-            
-            # Log the number of files found
-            if not hasattr(self, 'last_pcd_log_time') or time.time() - self.last_pcd_log_time > 5.0:
-                self.get_logger().info(f"Found {len(pcd_files)} PCD files in {self.output_dir}")
-                self.last_pcd_log_time = time.time()
-                
-        except Exception as e:
-            self.get_logger().error(f"Error updating PCD file list: {str(e)}")
-
-    def handle_keyboard_input(self):
-        """Handle keyboard input for controlling visualization and playback."""
-        try:
-            # Check if any key is pressed
-            key = cv2.waitKey(1) & 0xFF
-            
-            if key == ord('q'):
-                # Quit the program
-                self.get_logger().info("Quitting...")
-                rclpy.shutdown()
-                return
-                
-            elif key == ord('p'):
-                # Toggle PCD visualization
-                if not hasattr(self, 'show_pcd'):
-                    self.show_pcd = True
-                else:
-                    self.show_pcd = not self.show_pcd
-                self.get_logger().info(f"PCD visualization: {'enabled' if self.show_pcd else 'disabled'}")
-                
-            elif key == ord('c'):
-                # Toggle cone visualization
-                if not hasattr(self, 'show_cones'):
-                    self.show_cones = True
-                else:
-                    self.show_cones = not self.show_cones
-                self.get_logger().info(f"Cone visualization: {'enabled' if self.show_cones else 'disabled'}")
-                
-            elif key == ord('n'):
-                # Next PCD file
-                if hasattr(self, 'pcd_files') and len(self.pcd_files) > 0:
-                    if not hasattr(self, 'current_pcd_index'):
-                        self.current_pcd_index = 0
-                    else:
-                        self.current_pcd_index = (self.current_pcd_index + 1) % len(self.pcd_files)
-                    self.get_logger().info(f"Loading PCD file: {self.pcd_files[self.current_pcd_index]}")
-                    
-            elif key == ord('b'):
-                # Previous PCD file
-                if hasattr(self, 'pcd_files') and len(self.pcd_files) > 0:
-                    if not hasattr(self, 'current_pcd_index'):
-                        self.current_pcd_index = 0
-                    else:
-                        self.current_pcd_index = (self.current_pcd_index - 1) % len(self.pcd_files)
-                    self.get_logger().info(f"Loading PCD file: {self.pcd_files[self.current_pcd_index]}")
-                    
-        except Exception as e:
-            self.get_logger().error(f"Error handling keyboard input: {str(e)}")
-
-    def _pair_cones(self, camera_cones, lidar_cones):
-        """
-        Pair detected cones from camera and LiDAR data using enhanced association logic.
-        
-        Args:
-            camera_cones: List of cones detected by camera
-            lidar_cones: List of cones detected by LiDAR
-            
-        Returns:
-            List of paired cones with fused position and confidence
-        """
-        try:
-            paired_cones = []
-            unpaired_camera = camera_cones.copy()
-            unpaired_lidar = lidar_cones.copy()
-            
-            # Parameters for association
-            max_distance = 2.0  # Maximum distance for pairing (meters)
-            min_confidence = 0.3  # Minimum confidence threshold
-            
-            # Sort cones by confidence for better matching
-            unpaired_camera.sort(key=lambda x: x.get('confidence', 0.0), reverse=True)
-            unpaired_lidar.sort(key=lambda x: x.get('confidence', 0.0), reverse=True)
-            
-            # Create distance matrix between all pairs
-            if unpaired_camera and unpaired_lidar:
-                distances = np.zeros((len(unpaired_camera), len(unpaired_lidar)))
-                for i, cam_cone in enumerate(unpaired_camera):
-                    for j, lidar_cone in enumerate(unpaired_lidar):
-                        # Calculate 3D distance between cones
-                        cam_pos = np.array(cam_cone['position'])
-                        lidar_pos = np.array(lidar_cone['position'])
-                        distances[i, j] = np.linalg.norm(cam_pos - lidar_pos)
-                
-                # Iteratively find best matches
-                while distances.size > 0 and np.min(distances) < max_distance:
-                    i, j = np.unravel_index(np.argmin(distances), distances.shape)
-                    
-                    cam_cone = unpaired_camera[i]
-                    lidar_cone = unpaired_lidar[j]
-                    
-                    # Calculate weighted position based on confidence
-                    cam_conf = cam_cone.get('confidence', 0.5)
-                    lidar_conf = lidar_cone.get('confidence', 0.5)
-                    
-                    total_conf = cam_conf + lidar_conf
-                    if total_conf > min_confidence:
-                        # Weighted average of positions
-                        fused_position = (
-                            np.array(cam_cone['position']) * cam_conf +
-                            np.array(lidar_cone['position']) * lidar_conf
-                        ) / total_conf
-                        
-                        # Combine class information
-                        fused_class = cam_cone.get('cls', lidar_cone.get('cls', 0))
-                        
-                        # Calculate fused confidence
-                        fused_confidence = min(1.0, (cam_conf + lidar_conf) / 1.5)
-                        
-                        # Create fused cone
-                        paired_cones.append({
-                            'position': fused_position.tolist(),
-                            'confidence': fused_confidence,
-                            'cls': fused_class,
-                            'sources': ['camera', 'lidar'],
-                            'camera_conf': cam_conf,
-                            'lidar_conf': lidar_conf
-                        })
-                    
-                    # Remove paired cones from unpaired lists
-                    unpaired_camera.pop(i)
-                    unpaired_lidar.pop(j)
-                    
-                    # Update distance matrix
-                    distances = np.delete(distances, i, axis=0)
-                    distances = np.delete(distances, j, axis=1)
-            
-            # Handle remaining unpaired cones
-            for cone in unpaired_camera:
-                if cone.get('confidence', 0.0) > min_confidence:
-                    cone['sources'] = ['camera']
-                    paired_cones.append(cone)
-            
-            for cone in unpaired_lidar:
-                if cone.get('confidence', 0.0) > min_confidence:
-                    cone['sources'] = ['lidar']
-                    paired_cones.append(cone)
-            
-            # Sort final cones by distance from vehicle
-            paired_cones.sort(key=lambda x: np.linalg.norm(np.array(x['position'])[:2]))
-            
-            # Log pairing results
-            self.get_logger().info(f"Paired {len(paired_cones)} cones: "
-                                f"{len(paired_cones) - len(unpaired_camera) - len(unpaired_lidar)} fused, "
-                                f"{len(unpaired_camera)} camera-only, "
-                                f"{len(unpaired_lidar)} lidar-only")
-            
-            return paired_cones
-            
-        except Exception as e:
-            self.get_logger().error(f"Error in cone pairing: {str(e)}")
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-            return []
-
-    def _smooth_path(self, path_points, smoothing_factor=0.8):
-        """
-        Smooth the path using enhanced Bezier curves and adaptive smoothing.
-        
-        Args:
-            path_points: List of (x, y) path points
-            smoothing_factor: Factor controlling smoothness (0-1)
-            
-        Returns:
-            Smoothed path points
-        """
-        try:
-            if len(path_points) < 3:
-                return path_points
-                
-            # Convert to numpy array for easier manipulation
-            points = np.array(path_points)
-            
-            # Detect sharp turns and U-turns for adaptive smoothing
-            angles = []
-            for i in range(1, len(points) - 1):
-                v1 = points[i] - points[i-1]
-                v2 = points[i+1] - points[i]
-                angle = np.arctan2(np.cross(v1, v2), np.dot(v1, v2))
-                angles.append(abs(angle))
-            
-            # Identify turn regions
-            turn_regions = []
-            current_turn = []
-            in_turn = False
-            turn_threshold = np.pi / 6  # 30 degrees
-            
-            for i, angle in enumerate(angles):
-                if angle > turn_threshold and not in_turn:
-                    in_turn = True
-                    current_turn = [i]
-                elif angle <= turn_threshold and in_turn:
-                    in_turn = False
-                    current_turn.append(i + 1)
-                    turn_regions.append(current_turn)
-                elif in_turn:
-                    current_turn.append(i + 1)
-            
-            if in_turn:
-                current_turn.append(len(angles))
-                turn_regions.append(current_turn)
-            
-            # Apply adaptive smoothing
-            smoothed_points = points.copy()
-            window_size = 5
-            
-            for i in range(window_size, len(points) - window_size):
-                # Check if point is in turn region
-                in_turn_region = False
-                for region in turn_regions:
-                    if region[0] <= i <= region[-1]:
-                        in_turn_region = True
-                        break
-                
-                # Adjust smoothing based on region
-                local_smoothing = smoothing_factor
-                if in_turn_region:
-                    # Reduce smoothing in turns for better accuracy
-                    local_smoothing *= 0.7
-                    
-                    # Add more points in sharp turns
-                    if i > 0 and i < len(points) - 1:
-                        v1 = points[i] - points[i-1]
-                        v2 = points[i+1] - points[i]
-                        angle = abs(np.arctan2(np.cross(v1, v2), np.dot(v1, v2)))
-                        
-                        if angle > np.pi / 3:  # 60 degrees
-                            # Insert intermediate points
-                            num_points = 3
-                            for j in range(1, num_points):
-                                t = j / num_points
-                                # Bezier interpolation
-                                p0 = points[i-1]
-                                p1 = points[i]
-                                p2 = points[i+1]
-                                new_point = (1-t)**2 * p0 + 2*(1-t)*t * p1 + t**2 * p2
-                                smoothed_points = np.insert(smoothed_points, i+j, new_point, axis=0)
-                
-                # Apply smoothing with adaptive window
-                window = points[max(0, i-window_size):min(len(points), i+window_size+1)]
-                weights = np.exp(-0.5 * np.arange(-window_size, window_size+1)**2 / window_size)
-                weights = weights[:len(window)]
-                weights /= np.sum(weights)
-                
-                smoothed_points[i] = np.sum(window * weights[:, np.newaxis], axis=0)
-            
-            # Preserve endpoints
-            smoothed_points[0] = points[0]
-            smoothed_points[-1] = points[-1]
-            
-            # Apply curvature-based refinement
-            refined_points = []
-            for i in range(len(smoothed_points) - 1):
-                refined_points.append(smoothed_points[i])
-                
-                # Add intermediate points in high-curvature regions
-                if i > 0 and i < len(smoothed_points) - 1:
-                    v1 = smoothed_points[i] - smoothed_points[i-1]
-                    v2 = smoothed_points[i+1] - smoothed_points[i]
-                    angle = abs(np.arctan2(np.cross(v1, v2), np.dot(v1, v2)))
-                    
-                    if angle > np.pi / 4:  # 45 degrees
-                        # Add intermediate point using Bezier curve
-                        t = 0.5
-                        p0 = smoothed_points[i-1]
-                        p1 = smoothed_points[i]
-                        p2 = smoothed_points[i+1]
-                        intermediate = (1-t)**2 * p0 + 2*(1-t)*t * p1 + t**2 * p2
-                        refined_points.append(intermediate)
-            
-            refined_points.append(smoothed_points[-1])
-            
-            # Final smoothing pass for consistency
-            final_points = np.array(refined_points)
-            for i in range(1, len(final_points) - 1):
-                final_points[i] = (final_points[i-1] + final_points[i] * 2 + final_points[i+1]) / 4
-            
-            # Log smoothing results
-            self.get_logger().info(f"Smoothed path: {len(path_points)} points -> {len(final_points)} points "
-                                f"with {len(turn_regions)} turn regions")
-            
-            return final_points.tolist()
-            
-        except Exception as e:
-            self.get_logger().error(f"Error smoothing path: {str(e)}")
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-            return path_points
-
-    def calculate_steering(self, path_points, current_speed):
-        """
-        Calculate steering angle with enhanced control for turns and U-turns.
-        
-        Args:
-            path_points: List of (x, y) path points
-            current_speed: Current vehicle speed in m/s
-            
-        Returns:
-            Steering angle in range [-1, 1]
-        """
-        try:
-            if not path_points or len(path_points) < 2:
-                return 0.0
-                
-            # Get vehicle state
-            if not hasattr(self, 'vehicle') or not self.vehicle:
-                return 0.0
-                
-            vehicle_transform = self.vehicle.get_transform()
-            vehicle_location = vehicle_transform.location
-            vehicle_rotation = vehicle_transform.rotation
-            
-            # Convert vehicle rotation to radians
-            yaw = np.radians(vehicle_rotation.yaw)
-            
-            # Create rotation matrix
-            cos_yaw = np.cos(yaw)
-            sin_yaw = np.sin(yaw)
-            rotation_matrix = np.array([
-                [cos_yaw, -sin_yaw],
-                [sin_yaw, cos_yaw]
-            ])
-            
-            # Transform path points to vehicle's local frame
-            local_points = []
-            for point in path_points:
-                # Convert to vehicle's local frame
-                dx = point[0] - vehicle_location.x
-                dy = point[1] - vehicle_location.y
-                local_point = np.linalg.inv(rotation_matrix) @ np.array([dx, dy])
-                local_points.append(local_point)
-            
-            # Find closest point and look-ahead point
-            closest_idx = 0
-            min_dist = float('inf')
-            for i, point in enumerate(local_points):
-                dist = np.hypot(point[0], point[1])
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_idx = i
-            
-            # Dynamic look-ahead distance based on speed and curvature
-            base_lookahead = max(2.0, min(5.0, current_speed * 1.0))
-            
-            # Calculate path curvature at closest point
-            if closest_idx > 0 and closest_idx < len(local_points) - 1:
-                prev_point = local_points[closest_idx - 1]
-                curr_point = local_points[closest_idx]
-                next_point = local_points[closest_idx + 1]
-                
-                # Calculate angles
-                v1 = curr_point - prev_point
-                v2 = next_point - curr_point
-                angle = abs(np.arctan2(np.cross(v1, v2), np.dot(v1, v2)))
-                
-                # Adjust look-ahead based on curvature
-                curvature_factor = 1.0 - min(1.0, angle / np.pi)
-                base_lookahead *= curvature_factor
-            
-            # Find look-ahead point
-            lookahead_idx = closest_idx
-            accumulated_dist = 0.0
-            
-            for i in range(closest_idx, len(local_points) - 1):
-                point_dist = np.hypot(local_points[i+1][0] - local_points[i][0],
-                                    local_points[i+1][1] - local_points[i][1])
-                accumulated_dist += point_dist
-                
-                if accumulated_dist >= base_lookahead:
-                    lookahead_idx = i + 1
-                    break
-            
-            # Get look-ahead point
-            target_point = local_points[lookahead_idx]
-            
-            # Calculate steering angle using pure pursuit
-            target_dist = np.hypot(target_point[0], target_point[1])
-            if target_dist < 0.1:  # Avoid division by zero
-                return 0.0
-                
-            # Calculate steering angle
-            chord_length = target_dist
-            steering_angle = 2.0 * target_point[0] / (chord_length * chord_length)
-            
-            # Check for U-turn condition
-            if hasattr(self, 'uturn_state') and self.uturn_state.get('detected', False):
-                uturn_distance = self.uturn_state.get('distance', float('inf'))
-                uturn_direction = self.uturn_state.get('direction', 'right')
-                
-                if uturn_distance < 10.0:  # Close to U-turn point
-                    # Amplify steering for U-turn
-                    steering_factor = 1.5 * (1.0 - uturn_distance / 10.0)
-                    if uturn_direction == 'left':
-                        steering_angle = min(-0.7, steering_angle * (1.0 + steering_factor))
-                    else:  # right
-                        steering_angle = max(0.7, steering_angle * (1.0 + steering_factor))
-            
-            # Apply speed-based steering limits
-            max_steering = 1.0
-            if current_speed > 5.0:  # Reduce max steering at higher speeds
-                max_steering = max(0.3, 1.0 - (current_speed - 5.0) * 0.1)
-            
-            # Smooth steering changes
-            if hasattr(self, 'prev_steering'):
-                max_change = 0.1 * (1.0 + current_speed * 0.05)  # More aggressive at higher speeds
-                steering_angle = np.clip(steering_angle,
-                                       self.prev_steering - max_change,
-                                       self.prev_steering + max_change)
-            
-            # Store for next iteration
-            self.prev_steering = steering_angle
-            
-            # Final steering limits
-            steering_angle = np.clip(steering_angle, -max_steering, max_steering)
-            
-            # Log steering calculation
-            self.get_logger().debug(f"Steering: angle={steering_angle:.2f}, "
-                                 f"lookahead={base_lookahead:.1f}m, "
-                                 f"target=({target_point[0]:.1f}, {target_point[1]:.1f})")
-            
-            return float(steering_angle)
-            
-        except Exception as e:
-            self.get_logger().error(f"Error calculating steering: {str(e)}")
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-            return 0.0
-
-    def visualize_cone_map(self):
-        """
-        Visualize the cone map in RViz.
-        
-        This method creates markers for all the cones in the map and publishes them to RViz.
-        """
-        try:
-            from visualization_msgs.msg import MarkerArray, Marker
-            from std_msgs.msg import ColorRGBA
-            from geometry_msgs.msg import Point
-            
-            # Create marker array for cones
             marker_array = MarkerArray()
-            
-            # Group cones by class
-            cones_by_class = {}
-            for i, cone in enumerate(self.cone_map):
-                x, y, conf, cls = cone
-                cls = int(cls)
-                if cls not in cones_by_class:
-                    cones_by_class[cls] = []
-                cones_by_class[cls].append((x, y, conf, i))
-            
-            # Add markers for each class
             marker_id = 0
             
-            # Class colors: yellow, blue, white (unknown)
-            class_colors = {
-                0: ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0),  # Yellow
-                1: ColorRGBA(r=0.0, g=0.0, b=1.0, a=1.0),  # Blue
-                2: ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)   # White (unknown)
-            }
-            
-            for cls, cones in cones_by_class.items():
-                # Create a marker for this class
-                marker = Marker()
-                marker.header.frame_id = "map"
-                marker.header.stamp = self.get_clock().now().to_msg()
-                marker.ns = f"cones_class_{cls}"
-                marker.id = cls
-                marker.type = Marker.SPHERE_LIST
-                marker.action = Marker.ADD
+            # Visualize camera-detected cones
+            if hasattr(self.zed_camera, 'cone_detections'):
+                # Define a default field of view if not present in camera object
+                camera_fov_h = 90.0  # Default horizontal field of view in degrees
+                if hasattr(self.zed_camera, 'fov_h'):
+                    camera_fov_h = self.zed_camera.fov_h
                 
-                # Set marker properties
-                marker.pose.orientation.w = 1.0
-                marker.scale.x = 0.5  # Cone diameter
-                marker.scale.y = 0.5
-                marker.scale.z = 0.5
-                
-                # Set color based on class
-                marker.color = class_colors.get(cls, ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0))
-                
-                # Add points for each cone
-                for x, y, conf, _ in cones:
-                    point = Point()
-                    point.x = x
-                    point.y = y
-                    point.z = 0.25  # Slightly above ground
-                    marker.points.append(point)
+                for cone in self.zed_camera.cone_detections:
+                    # Skip if no depth info
+                    if 'depth' not in cone:
+                        continue
+                        
+                    # Get cone data
+                    depth = cone['depth']
+                    cls = cone.get('cls', 2)  # Default to unknown class (2)
                     
-                    # Make color opacity depend on confidence
-                    color = ColorRGBA()
-                    color.r = marker.color.r
-                    color.g = marker.color.g
-                    color.b = marker.color.b
-                    color.a = min(1.0, 0.5 + conf * 0.5)  # Scale opacity with confidence
-                    marker.colors.append(color)
-                
-                # Add marker to array
-                marker_array.markers.append(marker)
-                marker_id += 1
+                    # Get cone position in vehicle frame
+                    if 'box' in cone:
+                        x1, y1, x2, y2 = cone['box']
+                        center_x = (x1 + x2) // 2
+                        
+                        # Calculate lateral position from image center
+                        image_center_x = self.zed_camera.resolution[0] // 2
+                        angle_rad = np.radians(((center_x - image_center_x) / image_center_x) * (camera_fov_h / 2))
+                        lateral = depth * np.tan(angle_rad)
+                        
+                        # Get vehicle position and orientation
+                        if hasattr(self, 'vehicle') and self.vehicle:
+                            vehicle_transform = self.vehicle.get_transform()
+                            yaw_rad = np.radians(vehicle_transform.rotation.yaw)
+                            
+                            # Transform to world coordinates
+                            world_x = vehicle_transform.location.x + depth * np.cos(yaw_rad) - lateral * np.sin(yaw_rad)
+                            world_y = vehicle_transform.location.y + depth * np.sin(yaw_rad) + lateral * np.cos(yaw_rad)
+                            world_z = vehicle_transform.location.z + 0.2  # Slightly above ground
+                            
+                            # Create marker
+                            marker = Marker()
+                            marker.header.frame_id = "map"
+                            marker.header.stamp = self.get_clock().now().to_msg()
+                            marker.ns = "cone_detections"
+                            marker.id = marker_id
+                            marker.type = Marker.CYLINDER
+                            marker.action = Marker.ADD
+                            
+                            # Set position
+                            marker.pose.position.x = world_x
+                            marker.pose.position.y = world_y
+                            marker.pose.position.z = world_z
+                            
+                            # Set orientation (upright)
+                            marker.pose.orientation.w = 1.0
+                            
+                            # Set scale
+                            marker.scale.x = 0.3  # Diameter
+                            marker.scale.y = 0.3  # Diameter
+                            marker.scale.z = 0.5  # Height
+                            
+                            # Set color based on class (0=yellow, 1=blue, 2=unknown)
+                            if cls == 0:  # Yellow
+                                marker.color.r = 1.0
+                                marker.color.g = 1.0
+                                marker.color.b = 0.0
+                            elif cls == 1:  # Blue
+                                marker.color.r = 0.0
+                                marker.color.g = 0.0
+                                marker.color.b = 1.0
+                            else:  # Unknown
+                                marker.color.r = 1.0
+                                marker.color.g = 1.0
+                                marker.color.b = 1.0
+                                
+                            marker.color.a = 0.8
+                            
+                            # Set lifetime
+                            marker.lifetime.sec = 1
+                            
+                            # Add to array
+                            marker_array.markers.append(marker)
+                            marker_id += 1
             
-            # Create a marker for the vehicle trajectory
-            if self.vehicle_poses:
-                trajectory_marker = Marker()
-                trajectory_marker.header.frame_id = "map"
-                trajectory_marker.header.stamp = self.get_clock().now().to_msg()
-                trajectory_marker.ns = "vehicle_trajectory"
-                trajectory_marker.id = marker_id
-                trajectory_marker.type = Marker.LINE_STRIP
-                trajectory_marker.action = Marker.ADD
+            # If we have markers, publish them
+            if marker_array.markers:
+                if not hasattr(self, 'cone_vis_pub'):
+                    self.cone_vis_pub = self.create_publisher(MarkerArray, '/cone_detections', 10)
+                self.cone_vis_pub.publish(marker_array)
                 
-                # Set marker properties
-                trajectory_marker.pose.orientation.w = 1.0
-                trajectory_marker.scale.x = 0.1  # Line width
-                trajectory_marker.color.r = 0.0
-                trajectory_marker.color.g = 1.0
-                trajectory_marker.color.b = 0.0
-                trajectory_marker.color.a = 0.7
-                
-                # Add points for each pose
-                for x, y, _ in self.vehicle_poses:
-                    point = Point()
-                    point.x = x
-                    point.y = y
-                    point.z = 0.1  # Slightly above ground
-                    trajectory_marker.points.append(point)
-                
-                # Add marker to array
-                marker_array.markers.append(trajectory_marker)
-                marker_id += 1
-                
-                # Add current vehicle position marker
-                current_pos_marker = Marker()
-                current_pos_marker.header.frame_id = "map"
-                current_pos_marker.header.stamp = self.get_clock().now().to_msg()
-                current_pos_marker.ns = "vehicle_current_position"
-                current_pos_marker.id = marker_id
-                current_pos_marker.type = Marker.CUBE  # Using a cube to represent the vehicle
-                current_pos_marker.action = Marker.ADD
-                
-                # Set marker properties
-                current_pos_marker.pose.orientation.w = 1.0
-                current_pos_marker.scale.x = 0.8  # Vehicle width
-                current_pos_marker.scale.y = 1.6  # Vehicle length
-                current_pos_marker.scale.z = 0.4  # Vehicle height
-                
-                # Set position to the latest vehicle pose
-                latest_x, latest_y, _ = self.vehicle_poses[-1]
-                current_pos_marker.pose.position = Point(x=latest_x, y=latest_y, z=0.2)  # Slightly above ground
-                
-                # Set color (e.g., red for visibility)
-                current_pos_marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
-                
-                # Add marker to array
-                marker_array.markers.append(current_pos_marker)
-            
-            # Publish the marker array
-            if not hasattr(self, 'cone_map_pub'):
-                self.cone_map_pub = self.create_publisher(MarkerArray, '/cone_map', 10)
-            self.cone_map_pub.publish(marker_array)
-            
         except Exception as e:
-            self.get_logger().error(f"Error visualizing cone map: {str(e)}")
-
-    def publish_cone_map(self, cone_mapper):
-        """Publish the global cone map as a MarkerArray for RViz."""
-        marker_array = MarkerArray()
-        cones_by_class = cone_mapper.get_cones_by_class()
-        
-        for cls, cones in cones_by_class.items():
-            for i, (x, y) in enumerate(cones):
-                marker = Marker()
-                marker.header.frame_id = "map"
-                marker.header.stamp = self.get_clock().now().to_msg()
-                marker.ns = f"cone_{cls}"
-                marker.id = i
-                marker.type = Marker.CYLINDER
-                marker.action = Marker.ADD
-                marker.pose.position.x = x
-                marker.pose.position.y = y
-                marker.pose.position.z = 0.25  # Half cone height
-                marker.scale.x = 0.3  # Cone diameter
-                marker.scale.y = 0.3
-                marker.scale.z = 0.5  # Cone height
-                # Color based on class (yellow, blue, unknown)
-                if cls == 0:
-                    marker.color.r, marker.color.g, marker.color.b = 1.0, 1.0, 0.0  # Yellow
-                elif cls == 1:
-                    marker.color.r, marker.color.g, marker.color.b = 0.0, 0.0, 1.0  # Blue
-                else:
-                    marker.color.r, marker.color.g, marker.color.b = 0.5, 0.5, 0.5  # Gray
-                marker.color.a = 1.0
-                marker_array.markers.append(marker)
-        
-        self.cone_map_pub.publish(marker_array)
-
-    def publish_path(self, path_planner):
-        """Publish the planned path as a Marker for RViz."""
-        if not path_planner.path:
-            return
-        
-        marker = Marker()
-        marker.header.frame_id = "vehicle"
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = "path"
-        marker.id = 0
-        marker.type = Marker.LINE_STRIP
-        marker.action = Marker.ADD
-        marker.scale.x = 0.1  # Line width
-        marker.color.r, marker.color.g, marker.color.b = 0.0, 1.0, 0.0  # Green
-        marker.color.a = 1.0
-        
-        for x, y in path_planner.path:
-            point = Point()
-            point.x = float(y)  # Depth (forward) as x in vehicle frame
-            point.y = float(x)  # Lateral as y in vehicle frame
-            point.z = 0.0
-            marker.points.append(point)
-        
-        self.path_pub.publish(marker)
-
-    def publish_lidar_points(self, point_cloud):
-        """Publish raw LiDAR points for RViz."""
-        header = Header()
-        header.frame_id = "lidar"
-        header.stamp = self.get_clock().now().to_msg()
-        fields = [pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
-                  pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
-                  pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1)]
-        points = [(p[1], p[0], p[2]) for p in point_cloud]  # Swap x/y to match vehicle frame
-        cloud_msg = pc2.create_cloud(header, fields, points)
-        self.lidar_pub.publish(cloud_msg)
-
-    def save_map_and_path(self, filename="thesis_map.txt"):
-        """Save the cone map and path to a file."""
-        with open(filename, 'w') as f:
-            f.write("Cone Map (x, y, class):\n")
-            for cone in self.cone_mapper.cone_map:
-                f.write(f"{cone[0]}, {cone[1]}, {int(cone[3])}\n")
-            f.write("\nPath (x, y):\n")
-            if self.path_planner.path:
-                for x, y in self.path_planner.path:
-                    f.write(f"{x}, {y}\n")
-        self.get_logger().info(f"Map and path saved to {filename}")
+            self.get_logger().error(f"Error visualizing cones: {str(e)}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
 
 
 def main(args=None):

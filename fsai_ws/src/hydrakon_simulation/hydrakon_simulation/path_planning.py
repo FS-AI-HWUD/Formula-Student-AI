@@ -1,611 +1,1232 @@
 import numpy as np
-from scipy.interpolate import CubicSpline
 import cv2
+import math
+from typing import List, Tuple, Dict, Optional, Union
+
+"""
+Pure Pursuit Path Planner for Formula Student
+
+This module implements a path planning system using the pure pursuit algorithm
+specifically designed for cone-based Formula Student autonomous racing.
+
+It focuses on looking ahead for 3 cone pairs to determine the optimal path
+and steering angle based on the pure pursuit algorithm.
+
+Author: Atlas Racing
+"""
+
+class WorldCone:
+    """Class to store cone in world coordinates."""
+    def __init__(self, x, depth, cls, confidence=1.0):
+        self.x = x          # Lateral position in meters (positive = left, negative = right)
+        self.depth = depth  # Forward distance in meters
+        self.cls = cls      # 0 for yellow, 1 for blue
+        self.confidence = confidence  # Detection confidence
+
+
+class ConePair:
+    """Class to store a pair of cones (one yellow, one blue)."""
+    def __init__(self, yellow, blue, midpoint, width, valid=True):
+        self.yellow = yellow          # Yellow cone (WorldCone or None)
+        self.blue = blue              # Blue cone (WorldCone or None)
+        self.midpoint = midpoint      # (x, depth) of midpoint
+        self.width = width            # Track width at this pair
+        self.valid = valid            # Whether this pair is valid
+    
+    @classmethod
+    def from_cones(cls, yellow, blue, default_width=3.5):
+        """Create a cone pair from yellow and blue cones."""
+        if yellow and blue:
+            midpoint_x = (yellow.x + blue.x) / 2
+            midpoint_depth = (yellow.depth + blue.depth) / 2
+            width = abs(yellow.x - blue.x)
+            return cls(yellow, blue, (midpoint_x, midpoint_depth), width)
+        elif yellow:
+            # Only yellow cone available, estimate blue position
+            midpoint_x = yellow.x - (default_width / 2)
+            return cls(yellow, None, (midpoint_x, yellow.depth), default_width)
+        elif blue:
+            # Only blue cone available, estimate yellow position
+            midpoint_x = blue.x + (default_width / 2)
+            return cls(None, blue, (midpoint_x, blue.depth), default_width)
+        else:
+            # Should not happen, but for safety
+            return cls(None, None, (0, 0), default_width, valid=False)
+
+
+class ConePair:
+    """Class to store a pair of cones (one yellow, one blue)."""
+    def __init__(self, yellow, blue, midpoint, width, valid=True):
+        self.yellow = yellow          # Yellow cone (WorldCone or None)
+        self.blue = blue              # Blue cone (WorldCone or None)
+        self.midpoint = midpoint      # (x, depth) of midpoint
+        self.width = width            # Track width at this pair
+        self.valid = valid            # Whether this pair is valid
+    
+    @classmethod
+    def from_cones(cls, yellow, blue, default_width=3.5):
+        """Create a cone pair from yellow and blue cones."""
+        if yellow and blue:
+            midpoint_x = (yellow.x + blue.x) / 2
+            midpoint_depth = (yellow.depth + blue.depth) / 2
+            width = abs(yellow.x - blue.x)
+            return cls(yellow, blue, (midpoint_x, midpoint_depth), width)
+        elif yellow:
+            # Only yellow cone available, estimate blue position
+            midpoint_x = yellow.x - (default_width / 2)
+            return cls(yellow, None, (midpoint_x, yellow.depth), default_width)
+        elif blue:
+            # Only blue cone available, estimate yellow position
+            midpoint_x = blue.x + (default_width / 2)
+            return cls(None, blue, (midpoint_x, blue.depth), default_width)
+        else:
+            # Should not happen, but for safety
+            return cls(None, None, (0, 0), default_width, valid=False)
 
 class PathPlanner:
-    def __init__(self, zed_camera, depth_min=0.5, depth_max=12.5, cone_spacing=1.5, visualize=True):
+    """
+    Path planner using pure pursuit algorithm for Formula Student vehicle.
+    Focuses on looking ahead for 3 cone pairs to determine optimal path.
+    Maintains safe margins from cones and treats cones as gates.
+    """
+    
+    def __init__(self, 
+             zed_camera, 
+             depth_min=0.5, 
+             depth_max=12.5, 
+             cone_spacing=1.5,
+             visualize=True):
+        """
+        Initialize the pure pursuit path planner.
+        
+        Args:
+            zed_camera: Camera object that provides cone detections
+            depth_min: Minimum depth for cone detection in meters
+            depth_max: Maximum depth for cone detection in meters
+            cone_spacing: Expected spacing between cones in meters
+            visualize: Whether to visualize the path
+        """
         self.zed_camera = zed_camera
         self.depth_min = depth_min
         self.depth_max = depth_max
         self.cone_spacing = cone_spacing
         self.visualize = visualize
-        self.path = None
-        self.previous_path = None  # Store the previous path for temporal smoothing
+        
+        # Constants
         self.image_width = zed_camera.resolution[0]
         self.image_height = zed_camera.resolution[1]
-        self.fov_horizontal = 90.0
-        self.wheelbase = 2.7
+        self.fov_horizontal = 90.0  # Camera horizontal field of view in degrees
+        self.wheelbase = 2.7        # Vehicle wheelbase in meters
+        
+        # Pure pursuit parameters
+        self.lookahead_distance = 4.0  # Base lookahead distance in meters
+        self.max_lookahead_pairs = 3   # Maximum number of cone pairs to look ahead
+        self.default_track_width = 3.5 # Default track width in meters
+        
+        # Safety margin from cones (in meters)
+        self.safety_margin = 0.6       # Keep this distance from cones
+        
+        # State variables
+        self.cone_pairs = []           # List of ConePair objects
+        self.path = None               # Current path (for compatibility)
+        self.target_point = None       # Target point for pure pursuit (x, depth)
+        self.steering_angle = 0.0      # Current steering angle
+        self.current_track_width = self.default_track_width
+        
+        # Track visualization - store blue and yellow cone connections
+        self.blue_boundary = []        # List of blue cone positions (x, depth)
+        self.yellow_boundary = []      # List of yellow cone positions (x, depth)
+        
+        # U-turn detection
+        self.in_uturn = False          # Whether we're in a U-turn
+        self.uturn_side = "none"       # Which side (yellow or blue) the U-turn is on
+        self.turn_radius = self.default_track_width * 1.5  # Default turn radius
+        
+        # Previous state for smoothing
+        self.previous_path = None      # For compatibility with old code
+        self.prev_steering_angle = 0.0
+        self.prev_target_point = None
+        
+        # Debug image for visualization
+        self.debug_image = None
+
+    def update(self) -> float:
+        """
+        Update the planner with new detections and calculate steering angle.
+        
+        Returns:
+            float: Normalized steering angle in range [-1, 1]
+        """
+        try:
+            # Process detections
+            self._process_detections()
+            
+            # Connect the cones to form track boundaries
+            self._connect_boundary_cones()
+            
+            # Find target point
+            self._find_target_point()
+            
+            # Calculate steering
+            self._calculate_steering()
+            
+            # Smooth steering
+            self._smooth_steering()
+            
+            # Always visualize when called
+            if self.visualize and hasattr(self.zed_camera, 'rgb_image') and self.zed_camera.rgb_image is not None:
+                try:
+                    self.debug_image = self.draw_path(self.zed_camera.rgb_image.copy())
+                    cv2.imshow("Pure Pursuit Path", self.debug_image)
+                    cv2.waitKey(1)
+                except Exception as e:
+                    print(f"Warning: Visualization failed: {str(e)}")
+            
+            return self.steering_angle
+        except Exception as e:
+            print(f"Error in pure pursuit update: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return 0.0
+    
+    def plan_path(self):
+        """
+        Process cone detections and plan a path using pure pursuit algorithm.
+        This method is the main entry point and matches the original interface.
+        """
+        try:
+            # Process detections to create cone pairs
+            self._process_detections()
+            
+            # Connect the cones to form track boundaries
+            self._connect_boundary_cones()
+            
+            # Find target point for pure pursuit
+            self._find_target_point()
+            
+            # Calculate steering angle
+            self._calculate_steering()
+            
+            # Smooth steering
+            self._smooth_steering()
+            
+            # Create path from cone pairs for compatibility with old code
+            self._create_compatible_path()
+            
+            # Always visualize when called
+            if self.visualize and hasattr(self.zed_camera, 'rgb_image') and self.zed_camera.rgb_image is not None:
+                try:
+                    self.debug_image = self.draw_path(self.zed_camera.rgb_image.copy())
+                    cv2.imshow("Pure Pursuit Path", self.debug_image)
+                    cv2.waitKey(1)
+                except Exception as e:
+                    print(f"Warning: Visualization failed: {str(e)}")
+            
+            print(f"Pure pursuit path planned with {len(self.cone_pairs)} cone pairs")
+            
+        except Exception as e:
+            print(f"Error in pure pursuit path planning: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.path = None
+    
+    def _process_detections(self):
+        """Process cone detections from ZED camera."""
+        # Get cone detections
+        if not hasattr(self.zed_camera, 'cone_detections') or not self.zed_camera.cone_detections:
+            print("No cone detections available")
+            self.cone_pairs = []
+            return
+        
+        # Extract cone data
+        cones = []
+        depths = []
+        for detection in self.zed_camera.cone_detections:
+            if 'box' not in detection or 'cls' not in detection or 'depth' not in detection:
+                continue
+                
+            x1, y1, x2, y2 = detection['box']
+            cls = detection['cls']
+            depth = detection['depth']
+            print(f"Using cone: Class = {cls}, Depth = {depth:.2f}m, Box = ({x1}, {y1}, {x2}, {y2})")
+            cones.append((x1, y1, x2, y2, cls))
+            depths.append(depth)
+        
+        # Filter cones using existing method for compatibility
+        filtered_cones, filtered_depths = self._filter_cones(cones, depths)
+        
+        if not filtered_cones:
+            print("No cones after filtering")
+            self.cone_pairs = []
+            return
+        
+        # Convert to world coordinates
+        world_cones = self._to_world_coordinates(filtered_cones, filtered_depths)
+        
+        # Pair cones
+        self._pair_cones(world_cones)
     
     def _filter_cones(self, cones, depths):
+        """
+        Filter cones based on depth and other criteria.
+        Reuses the method from the original code for compatibility.
+        """
         filtered_cones = []
         filtered_depths = []
         
-        print("Skipping depth corridor filter as requested...")
+        print("Filtering cones...")
         for (x1, y1, x2, y2, cls), depth in zip(cones, depths):
-            center_x = (x1 + x2) // 2
-            center_y = (y1 + y2) // 2
-            filtered_cones.append((center_x, center_y, cls))
-            filtered_depths.append(depth)
-            print(f"Kept cone: Class = {cls}, Depth = {depth:.2f}m, Center = ({center_x}, {center_y})")
+            # Apply depth filter
+            if self.depth_min <= depth <= self.depth_max:
+                center_x = (x1 + x2) // 2
+                center_y = (y1 + y2) // 2
+                filtered_cones.append((center_x, center_y, cls))
+                filtered_depths.append(depth)
+                print(f"Kept cone: Class = {cls}, Depth = {depth:.2f}m, Center = ({center_x}, {center_y})")
+            else:
+                print(f"Filtered out cone: Depth = {depth:.2f}m out of range [{self.depth_min}, {self.depth_max}]")
         
-        print(f"Total cones after removing filter: {len(filtered_cones)}")
+        print(f"Total cones after filtering: {len(filtered_cones)}")
         return filtered_cones, filtered_depths
     
-    def detect_uturn(self, yellow_world, blue_world, min_cones=2, shift_threshold=0.3, depth_tolerance=2.0):
-        """Detect if the cone arrangement indicates a U-turn with improved recognition.
+    def _to_world_coordinates(self, filtered_cones, filtered_depths):
+        """
+        Convert image-space cone detections to world coordinates.
         
         Args:
-            yellow_world (list): List of (x, depth) coordinates for yellow cones
-            blue_world (list): List of (x, depth) coordinates for blue cones
-            min_cones (int): Minimum number of cones required for each color
-            shift_threshold (float): Minimum lateral shift threshold
-            depth_tolerance (float): Maximum depth difference for cone pairing
+            filtered_cones: List of (center_x, center_y, cls) tuples
+            filtered_depths: List of depth values for each cone
             
         Returns:
-            tuple: (is_uturn, uturn_info) where uturn_info is a dict with 'depth' and 'direction'
+            List of WorldCone objects
         """
-        if len(yellow_world) < min_cones or len(blue_world) < min_cones:
-            return False, None
+        world_cones = []
         
-        # Sort cones by depth
-        yellow_sorted = sorted(yellow_world, key=lambda p: p[1])
-        blue_sorted = sorted(blue_world, key=lambda p: p[1])
+        for (center_x, center_y, cls), depth in zip(filtered_cones, filtered_depths):
+            # Calculate angle from center of image
+            angle = ((center_x - self.image_width / 2) / (self.image_width / 2)) * (self.fov_horizontal / 2)
+            
+            # Convert to world coordinates
+            world_x = depth * np.tan(np.radians(angle))
+            
+            # Add to world cones list
+            world_cones.append(WorldCone(world_x, depth, cls))
         
-        # Check for characteristic U-turn patterns:
-        # 1. Significant lateral shift in cones
-        # 2. Cones get closer to each other and then further apart
-        # 3. Both boundaries curve in the same direction
+        return world_cones
+    
+    def _pair_cones(self, world_cones):
+        """
+        Pair yellow and blue cones to create track boundaries.
         
-        # Calculate lateral shifts for both boundaries
-        if len(yellow_sorted) >= 3:
-            yellow_shifts = [(yellow_sorted[i][0] - yellow_sorted[i-1][0]) / 
-                            max(0.1, yellow_sorted[i][1] - yellow_sorted[i-1][1]) 
-                            for i in range(1, len(yellow_sorted))]
+        Args:
+            world_cones: List of WorldCone objects
+        """
+        # Separate yellow and blue cones
+        yellow_cones = [cone for cone in world_cones if cone.cls == 0]
+        blue_cones = [cone for cone in world_cones if cone.cls == 1]
+        
+        # Sort by depth
+        yellow_cones.sort(key=lambda c: c.depth)
+        blue_cones.sort(key=lambda c: c.depth)
+        
+        # Store yellow and blue cones for boundary visualization
+        self.yellow_boundary = [(cone.x, cone.depth) for cone in yellow_cones]
+        self.blue_boundary = [(cone.x, cone.depth) for cone in blue_cones]
+        
+        print(f"Yellow cones: {len(yellow_cones)}, Blue cones: {len(blue_cones)}")
+        
+        # Clear previous pairs
+        self.cone_pairs = []
+        
+        # If no cones detected, return
+        if not yellow_cones and not blue_cones:
+            return
+        
+        # Calculate reasonable track width from data if possible
+        track_widths = []
+        for y in yellow_cones:
+            for b in blue_cones:
+                # Match cones at similar depths
+                if abs(y.depth - b.depth) < 2.0:
+                    width = abs(y.x - b.x)
+                    if 2.0 < width < 6.0:  # Reasonable track width range
+                        track_widths.append(width)
+        
+        # Update track width estimate
+        if track_widths:
+            self.current_track_width = np.median(track_widths)
+            print(f"Calculated track width: {self.current_track_width:.2f}m")
+        
+        # Create initial pairs using direct matching
+        matched_yellows = set()
+        matched_blues = set()
+        
+        # First pass: direct matching of cones at similar depths
+        for i, y in enumerate(yellow_cones):
+            best_blue = None
+            best_dist = float('inf')
+            
+            for j, b in enumerate(blue_cones):
+                depth_diff = abs(y.depth - b.depth)
+                if depth_diff < 2.0 and depth_diff < best_dist:
+                    best_dist = depth_diff
+                    best_blue = j
+            
+            if best_blue is not None:
+                # Create a pair
+                b = blue_cones[best_blue]
+                pair = ConePair.from_cones(y, b, self.current_track_width)
+                self.cone_pairs.append(pair)
+                
+                # Mark as matched
+                matched_yellows.add(i)
+                matched_blues.add(best_blue)
+        
+        # Second pass: handle unpaired cones
+        # Add remaining yellow cones
+        for i, y in enumerate(yellow_cones):
+            if i not in matched_yellows:
+                pair = ConePair.from_cones(y, None, self.current_track_width)
+                self.cone_pairs.append(pair)
+        
+        # Add remaining blue cones
+        for i, b in enumerate(blue_cones):
+            if i not in matched_blues:
+                pair = ConePair.from_cones(None, b, self.current_track_width)
+                self.cone_pairs.append(pair)
+        
+        # Sort by depth
+        self.cone_pairs.sort(key=lambda p: p.midpoint[1])
+        
+        # Limit to max_lookahead_pairs
+        if len(self.cone_pairs) > self.max_lookahead_pairs:
+            self.cone_pairs = self.cone_pairs[:self.max_lookahead_pairs]
+            print(f"Limited to {self.max_lookahead_pairs} cone pairs")
+        
+        print(f"Created {len(self.cone_pairs)} cone pairs")
+    
+    def _connect_boundary_cones(self):
+        """Connect cones to form continuous track boundaries with improved U-turn handling"""
+        if not self.cone_pairs:
+            return
+                
+        # Ensure we have the blue and yellow boundaries
+        if not hasattr(self, 'blue_boundary') or not hasattr(self, 'yellow_boundary'):
+            self.blue_boundary = []
+            self.yellow_boundary = []
+                
+        # Reset boundaries for fresh calculation
+        self.blue_boundary = []
+        self.yellow_boundary = []
+        
+        # Extract from cone pairs
+        for pair in self.cone_pairs:
+            if pair.blue is not None:  # Explicit None check
+                self.blue_boundary.append((pair.blue.x, pair.blue.depth))
+            if pair.yellow is not None:  # Explicit None check 
+                self.yellow_boundary.append((pair.yellow.x, pair.yellow.depth))
+        
+        # Sort by depth
+        self.blue_boundary.sort(key=lambda p: p[1])
+        self.yellow_boundary.sort(key=lambda p: p[1])
+        
+        # Count how many cones of each color we have
+        yellow_count = len(self.yellow_boundary)
+        blue_count = len(self.blue_boundary)
+        
+        # Check if we potentially have a U-turn (significant imbalance of cone colors)
+        potential_uturn = False
+        uturn_yellow_side = False
+        uturn_blue_side = False
+        
+        if yellow_count > 1 and yellow_count > 2 * blue_count:
+            potential_uturn = True
+            uturn_yellow_side = True
+            print(f"U-turn detection: Likely yellow-side U-turn ({yellow_count} yellow vs {blue_count} blue)")
+        elif blue_count > 1 and blue_count > 2 * yellow_count:
+            potential_uturn = True
+            uturn_blue_side = True
+            print(f"U-turn detection: Likely blue-side U-turn ({blue_count} blue vs {yellow_count} yellow)")
+        
+        # If we have a potential U-turn, examine the cone pattern
+        if potential_uturn:
+            if uturn_yellow_side and yellow_count >= 3:
+                # Analyze yellow cone pattern for U-turn shape
+                yellow_xs = [x for x, _ in self.yellow_boundary]
+                yellow_depth_sorted = sorted(self.yellow_boundary, key=lambda p: p[1])  # Sort by increasing depth
+                
+                # Check if yellows form an arc (x-coordinates change consistently)
+                if len(yellow_xs) >= 3:
+                    # Check if the x-values are decreasing (moving right to left as depth increases)
+                    x_diffs = [yellow_xs[i] - yellow_xs[i-1] for i in range(1, len(yellow_xs))]
+                    consistent_direction = all(diff < 0 for diff in x_diffs) or all(diff > 0 for diff in x_diffs)
+                    
+                    if consistent_direction:
+                        print("U-turn confirmed: Yellow cones form an arc with consistent direction")
+                        # Store that we're in a U-turn for reference
+                        self.in_uturn = True
+                        self.uturn_side = "yellow"
+                        
+                        # Calculate typical turn radius for the path planning
+                        if len(self.yellow_boundary) >= 2:
+                            # Estimate radius from two farthest cones
+                            first_cone = self.yellow_boundary[0]
+                            last_cone = self.yellow_boundary[-1]
+                            dx = last_cone[0] - first_cone[0]
+                            dy = last_cone[1] - first_cone[1]
+                            self.turn_radius = np.sqrt(dx**2 + dy**2) / 2
+                            print(f"Estimated turn radius: {self.turn_radius:.2f}m")
+                        else:
+                            # Fallback to a reasonable radius
+                            self.turn_radius = self.default_track_width * 1.5
+            
+            elif uturn_blue_side and blue_count >= 3:
+                # Analyze blue cone pattern for U-turn shape
+                blue_xs = [x for x, _ in self.blue_boundary]
+                blue_depth_sorted = sorted(self.blue_boundary, key=lambda p: p[1])  # Sort by increasing depth
+                
+                # Check if blues form an arc (x-coordinates change consistently)
+                if len(blue_xs) >= 3:
+                    # Check if the x-values are decreasing (moving right to left as depth increases)
+                    x_diffs = [blue_xs[i] - blue_xs[i-1] for i in range(1, len(blue_xs))]
+                    consistent_direction = all(diff < 0 for diff in x_diffs) or all(diff > 0 for diff in x_diffs)
+                    
+                    if consistent_direction:
+                        print("U-turn confirmed: Blue cones form an arc with consistent direction")
+                        # Store that we're in a U-turn for reference
+                        self.in_uturn = True
+                        self.uturn_side = "blue"
+                        
+                        # Calculate typical turn radius for the path planning
+                        if len(self.blue_boundary) >= 2:
+                            # Estimate radius from two farthest cones
+                            first_cone = self.blue_boundary[0]
+                            last_cone = self.blue_boundary[-1]
+                            dx = last_cone[0] - first_cone[0]
+                            dy = last_cone[1] - first_cone[1]
+                            self.turn_radius = np.sqrt(dx**2 + dy**2) / 2
+                            print(f"Estimated turn radius: {self.turn_radius:.2f}m")
+                        else:
+                            # Fallback to a reasonable radius
+                            self.turn_radius = self.default_track_width * 1.5
+            else:
+                # Not enough cones to confirm U-turn
+                self.in_uturn = False
+                self.uturn_side = "none"
         else:
-            yellow_shifts = []
+            # Not in a U-turn
+            self.in_uturn = False
+            self.uturn_side = "none"
+    
+    def _find_target_point(self):
+        """Find the target point for pure pursuit algorithm with improved cone hugging in U-turns."""
+        if not self.cone_pairs:
+            self.target_point = None
+            return
         
-        if len(blue_sorted) >= 3:
-            blue_shifts = [(blue_sorted[i][0] - blue_sorted[i-1][0]) / 
-                          max(0.1, blue_sorted[i][1] - blue_sorted[i-1][1]) 
-                          for i in range(1, len(blue_sorted))]
+        # Count how many pairs have only one cone
+        yellow_only_count = sum(1 for pair in self.cone_pairs if pair.yellow is not None and pair.blue is None)
+        blue_only_count = sum(1 for pair in self.cone_pairs if pair.blue is not None and pair.yellow is None)
+        
+        # Determine if we're in a potential U-turn (mostly seeing one color)
+        potential_uturn = False
+        follow_yellow = False
+        follow_blue = False
+        
+        if yellow_only_count > 1 and yellow_only_count > blue_only_count:
+            # Multiple yellow cones but few or no blue cones - might be a yellow-side U-turn
+            potential_uturn = True
+            follow_yellow = True
+            print(f"Potential U-turn detected for targeting! Following yellow cones ({yellow_only_count} yellow, {blue_only_count} blue)")
+        elif blue_only_count > 1 and blue_only_count > yellow_only_count:
+            # Multiple blue cones but few or no blue cones - might be a blue-side U-turn
+            potential_uturn = True
+            follow_blue = True
+            print(f"Potential U-turn detected for targeting! Following blue cones ({blue_only_count} blue, {yellow_only_count} yellow)")
+        
+        # If we're in a U-turn, find a target point that hugs the visible cones
+        if potential_uturn:
+            # Set shorter lookahead for U-turns
+            u_turn_lookahead = min(self.lookahead_distance, 2.0)  # Even shorter lookahead to hug curve
+            
+            # Find the target point directly from the cone boundary
+            if follow_yellow and self.yellow_boundary:
+                # Find the point on the yellow boundary closest to our lookahead distance
+                best_yellow_point = None
+                best_dist_diff = float('inf')
+                
+                for x, depth in self.yellow_boundary:
+                    dist_diff = abs(depth - u_turn_lookahead)
+                    if dist_diff < best_dist_diff:
+                        best_dist_diff = dist_diff
+                        best_yellow_point = (x, depth)
+                
+                if best_yellow_point:
+                    # Place target point right next to the yellow cone (slightly to the right)
+                    target_x = best_yellow_point[0] - self.safety_margin
+                    target_depth = best_yellow_point[1]
+                    self.target_point = (target_x, target_depth)
+                    print(f"U-turn: Hugging yellow cone at ({best_yellow_point[0]:.2f}, {best_yellow_point[1]:.2f})")
+                    return
+                    
+            elif follow_blue and self.blue_boundary:
+                # Find the point on the blue boundary closest to our lookahead distance
+                best_blue_point = None
+                best_dist_diff = float('inf')
+                
+                for x, depth in self.blue_boundary:
+                    dist_diff = abs(depth - u_turn_lookahead)
+                    if dist_diff < best_dist_diff:
+                        best_dist_diff = dist_diff
+                        best_blue_point = (x, depth)
+                
+                if best_blue_point:
+                    # Place target point right next to the blue cone (slightly to the left)
+                    target_x = best_blue_point[0] + self.safety_margin
+                    target_depth = best_blue_point[1]
+                    self.target_point = (target_x, target_depth)
+                    print(f"U-turn: Hugging blue cone at ({best_blue_point[0]:.2f}, {best_blue_point[1]:.2f})")
+                    return
+        
+        # If we're not in a U-turn or couldn't find a good cone to hug, use standard approach
+        # Get lookahead distance (adjusted based on speed if available)
+        lookahead = self.lookahead_distance
+        
+        # Find the pair closest to lookahead distance
+        best_pair = None
+        best_dist_diff = float('inf')
+        
+        for pair in self.cone_pairs:
+            dist_diff = abs(pair.midpoint[1] - lookahead)
+            if dist_diff < best_dist_diff:
+                best_dist_diff = dist_diff
+                best_pair = pair
+        
+        if best_pair:
+            # Handle based on whether we're in a potential U-turn
+            if potential_uturn:
+                if follow_yellow and best_pair.yellow is not None:
+                    # Following yellow cones in a U-turn - stay closer to yellow cones
+                    # Just use safety margin to follow cone more tightly
+                    adjusted_x = best_pair.yellow.x - self.safety_margin
+                    self.target_point = (adjusted_x, best_pair.yellow.depth)
+                    print(f"U-turn target: Hugging yellow cone at ({best_pair.yellow.x:.2f}, {best_pair.yellow.depth:.2f})")
+                
+                elif follow_blue and best_pair.blue is not None:
+                    # Following blue cones in a U-turn - stay closer to blue cones
+                    # Just use safety margin to follow cone more tightly
+                    adjusted_x = best_pair.blue.x + self.safety_margin
+                    self.target_point = (adjusted_x, best_pair.blue.depth)
+                    print(f"U-turn target: Hugging blue cone at ({best_pair.blue.x:.2f}, {best_pair.blue.depth:.2f})")
+                
+                # If the best pair has both cones even in U-turn mode, use standard approach
+                elif best_pair.yellow is not None and best_pair.blue is not None:
+                    # Standard case with both cones - use midpoint with safety margins
+                    yellow_x, blue_x = best_pair.yellow.x, best_pair.blue.x
+                    
+                    # Ensure we're not too close to either cone
+                    if yellow_x > blue_x:  # Normal case: yellow on left, blue on right
+                        adjusted_yellow_x = yellow_x - self.safety_margin
+                        adjusted_blue_x = blue_x + self.safety_margin
+                    else:  # Reversed case: blue on left, yellow on right
+                        adjusted_yellow_x = yellow_x + self.safety_margin
+                        adjusted_blue_x = blue_x - self.safety_margin
+                    
+                    # Check if there's still space between cones after applying margins
+                    if (yellow_x > blue_x and adjusted_yellow_x > adjusted_blue_x) or \
+                    (yellow_x < blue_x and adjusted_yellow_x < adjusted_blue_x):
+                        # Calculate new midpoint
+                        adjusted_midpoint_x = (adjusted_yellow_x + adjusted_blue_x) / 2
+                        
+                        # Update target point with adjusted midpoint
+                        self.target_point = (adjusted_midpoint_x, best_pair.midpoint[1])
+                    else:
+                        # Not enough space - use original midpoint
+                        self.target_point = best_pair.midpoint
+                        print(f"Warning: Not enough space for safety margin at depth {best_pair.midpoint[1]:.2f}m")
+                
+                # Fallback if no matching cones in the best pair
+                else:
+                    self.target_point = best_pair.midpoint
+                    print(f"Warning: U-turn detected but best pair doesn't have the needed cone type")
+            else:
+                # Standard approach (not a U-turn)
+                # Apply safety margin to keep away from cones
+                if best_pair.yellow is not None and best_pair.blue is not None:
+                    # We have both cones - adjust the midpoint to maintain safety margin
+                    yellow_x, blue_x = best_pair.yellow.x, best_pair.blue.x
+                    
+                    # Ensure we're not too close to either cone
+                    if yellow_x > blue_x:  # Normal case: yellow on left, blue on right
+                        adjusted_yellow_x = yellow_x - self.safety_margin
+                        adjusted_blue_x = blue_x + self.safety_margin
+                    else:  # Reversed case: blue on left, yellow on right
+                        adjusted_yellow_x = yellow_x + self.safety_margin
+                        adjusted_blue_x = blue_x - self.safety_margin
+                    
+                    # Check if there's still space between cones after applying margins
+                    if (yellow_x > blue_x and adjusted_yellow_x > adjusted_blue_x) or \
+                    (yellow_x < blue_x and adjusted_yellow_x < adjusted_blue_x):
+                        # Calculate new midpoint
+                        adjusted_midpoint_x = (adjusted_yellow_x + adjusted_blue_x) / 2
+                        
+                        # Update target point with adjusted midpoint
+                        self.target_point = (adjusted_midpoint_x, best_pair.midpoint[1])
+                    else:
+                        # Not enough space - use original midpoint
+                        self.target_point = best_pair.midpoint
+                        print(f"Warning: Not enough space for safety margin at depth {best_pair.midpoint[1]:.2f}m")
+                else:
+                    # Just one cone, use the existing midpoint but with safety margin
+                    if best_pair.yellow is not None:
+                        # Yellow cone (left) - move right by safety margin
+                        adjusted_x = best_pair.midpoint[0] - self.safety_margin 
+                        self.target_point = (adjusted_x, best_pair.midpoint[1])
+                    elif best_pair.blue is not None:
+                        # Blue cone (right) - move left by safety margin
+                        adjusted_x = best_pair.midpoint[0] + self.safety_margin
+                        self.target_point = (adjusted_x, best_pair.midpoint[1])
+                    else:
+                        # Fallback to original midpoint
+                        self.target_point = best_pair.midpoint
+            
+            print(f"Target point selected at ({self.target_point[0]:.2f}, {self.target_point[1]:.2f})")
         else:
-            blue_shifts = []
+            # Fallback: use the farthest pair
+            self.target_point = self.cone_pairs[-1].midpoint if self.cone_pairs else None
+    
+    def _calculate_steering(self):
+        """Calculate steering angle using pure pursuit algorithm."""
+        if not self.target_point:
+            self.steering_angle = 0.0
+            return
         
-        # Check for U-turn pattern - consistent shifts in both boundaries
-        is_uturn = False
-        uturn_depth = None
-        uturn_direction = None
+        # Get target point
+        target_x, target_depth = self.target_point
         
-        if yellow_shifts and blue_shifts:
-            # Get average shifts
-            avg_yellow_shift = sum(yellow_shifts) / len(yellow_shifts)
-            avg_blue_shift = sum(blue_shifts) / len(blue_shifts)
-            
-            # Calculate consistency of shifts (standard deviation)
-            yellow_consistency = np.std(yellow_shifts) if len(yellow_shifts) > 1 else 999
-            blue_consistency = np.std(blue_shifts) if len(blue_shifts) > 1 else 999
-            
-            # Check for consistent direction in shifts
-            yellow_direction = all(s > shift_threshold for s in yellow_shifts) or all(s < -shift_threshold for s in yellow_shifts)
-            blue_direction = all(s > shift_threshold for s in blue_shifts) or all(s < -shift_threshold for s in blue_shifts)
-            
-            # 1. Check for significant and consistent shifts
-            significant_shift = abs(avg_yellow_shift) > shift_threshold and abs(avg_blue_shift) > shift_threshold
-            consistent_shift = yellow_consistency < 0.4 and blue_consistency < 0.4
-            
-            # 2. Check for shifts in opposite directions (one boundary moves left, other right)
-            opposite_shifts = avg_yellow_shift * avg_blue_shift < 0
-            
-            # 3. Check track width pattern - narrows then widens (U-turn apex)
-            track_widths = []
-            for y_pos in yellow_sorted:
-                for b_pos in blue_sorted:
-                    if abs(y_pos[1] - b_pos[1]) < depth_tolerance:  # Similar depths
-                        width = abs(y_pos[0] - b_pos[0])
-                        track_widths.append((width, (y_pos[1] + b_pos[1]) / 2))  # Store width and average depth
-            
-            # Look for track width changes
-            if len(track_widths) >= 3:
-                track_widths.sort(key=lambda x: x[1])  # Sort by depth
-                
-                # Check for narrowing then widening pattern
-                width_changes = [track_widths[i][0] - track_widths[i-1][0] for i in range(1, len(track_widths))]
-                
-                # Look for sign change in width_changes (narrowing to widening)
-                sign_changes = []
-                for i in range(1, len(width_changes)):
-                    if width_changes[i-1] * width_changes[i] < 0:  # Sign change
-                        sign_changes.append(i)
-                
-                if sign_changes:
-                    # We have width pattern changes - look for narrowing then widening
-                    for idx in sign_changes:
-                        if idx > 0 and idx < len(width_changes) - 1:
-                            if width_changes[idx-1] < -0.1 and width_changes[idx+1] > 0.1:
-                                # We have a narrowing then widening pattern
-                                uturn_idx = idx + 1  # Position in track_widths
-                                uturn_depth = track_widths[uturn_idx][1]
-                                
-                                # Determine U-turn direction from shift patterns
-                                if avg_yellow_shift > 0 and avg_blue_shift < 0:
-                                    uturn_direction = "right"
-                                elif avg_yellow_shift < 0 and avg_blue_shift > 0:
-                                    uturn_direction = "left"
-                                else:
-                                    # If shift patterns are unclear, use track boundary positions
-                                    # Find depths near the U-turn
-                                    near_uturn = [(y, b) for y in yellow_sorted for b in blue_sorted 
-                                                 if abs(y[1] - uturn_depth) < depth_tolerance and abs(b[1] - uturn_depth) < depth_tolerance]
-                                    
-                                    if near_uturn:
-                                        # Average positions of boundaries near U-turn
-                                        avg_y = np.mean([y[0] for y, _ in near_uturn])
-                                        avg_b = np.mean([b[0] for _, b in near_uturn])
-                                        
-                                        # Usually yellow is positive X, blue is negative X
-                                        # If yellow is much larger than blue, likely turning right
-                                        if avg_y > avg_b:
-                                            uturn_direction = "right"
-                                        else:
-                                            uturn_direction = "left"
-                                
-                                is_uturn = True
-                                print(f"U-turn detected at depth {uturn_depth:.1f}m, direction: {uturn_direction}")
-                                break
-            
-            # Combine all evidence
-            if significant_shift and consistent_shift and opposite_shifts:
-                # Likely a U-turn - estimate the depth
-                if not uturn_depth:  # If not determined from width analysis
-                    # Find depth where track is narrowest
-                    if track_widths:
-                        min_width_idx = min(range(len(track_widths)), key=lambda i: track_widths[i][0])
-                        uturn_depth = track_widths[min_width_idx][1]
-                    else:
-                        # Estimate depth based on midpoint of detected cones
-                        yellow_mid_idx = len(yellow_sorted) // 2
-                        blue_mid_idx = len(blue_sorted) // 2
-                        uturn_depth = (yellow_sorted[yellow_mid_idx][1] + blue_sorted[blue_mid_idx][1]) / 2
-                
-                # Determine direction if not already set
-                if not uturn_direction:
-                    if avg_yellow_shift > 0 and avg_blue_shift < 0:
-                        uturn_direction = "right"
-                    elif avg_yellow_shift < 0 and avg_blue_shift > 0:
-                        uturn_direction = "left"
-                    else:
-                        uturn_direction = "unknown"
-                
-                is_uturn = True
-                print(f"U-turn detected at approximately {uturn_depth:.1f}m, direction: {uturn_direction}")
+        # Calculate angle to target point (from car's perspective)
+        alpha = np.arctan2(target_x, target_depth)
         
-        return is_uturn, {"depth": uturn_depth, "direction": uturn_direction} if is_uturn else None
+        # Pure pursuit steering angle calculation
+        steering_angle = np.arctan2(2 * self.wheelbase * np.sin(alpha), target_depth)
+        
+        # Convert to normalized steering angle [-1, 1]
+        max_steering_rad = np.radians(30.0)  # Maximum steering angle
+        self.steering_angle = np.clip(steering_angle / max_steering_rad, -1.0, 1.0)
+        
+        print(f"Pure pursuit steering angle: {self.steering_angle:.2f}")
+    
+    def _smooth_steering(self):
+        """Apply smoothing to steering angle for stability."""
+        if self.prev_steering_angle is not None:
+            # Exponential smoothing
+            alpha = 0.7  # Smoothing factor (higher = less smoothing)
+            old_steering = self.steering_angle
+            self.steering_angle = alpha * self.steering_angle + (1 - alpha) * self.prev_steering_angle
+            print(f"Smoothed steering: {old_steering:.2f} -> {self.steering_angle:.2f}")
+        
+        # Store current steering angle for next iteration
+        self.prev_steering_angle = self.steering_angle
+    
+    def _create_compatible_path(self):
+        """Create a path compatible with the original code's format that hugs visible cones in U-turns."""
+        if not self.cone_pairs:
+            self.path = None
+            return
+                    
+        # Create path that follows the midpoint of track with safety margins
+        waypoints = []
+        
+        # Count how many pairs have only one cone
+        yellow_only_count = sum(1 for pair in self.cone_pairs if pair.yellow is not None and pair.blue is None)
+        blue_only_count = sum(1 for pair in self.cone_pairs if pair.blue is not None and pair.yellow is None)
+        
+        # Determine if we're in a potential U-turn (mostly seeing one color)
+        potential_uturn = False
+        follow_yellow = False
+        follow_blue = False
+        
+        if yellow_only_count > 1 and yellow_only_count > blue_only_count:
+            # Multiple yellow cones but few or no blue cones - might be a yellow-side U-turn
+            potential_uturn = True
+            follow_yellow = True
+            print(f"Potential U-turn detected! Following yellow cones ({yellow_only_count} yellow, {blue_only_count} blue)")
+        elif blue_only_count > 1 and blue_only_count > yellow_only_count:
+            # Multiple blue cones but few or no yellow cones - might be a blue-side U-turn
+            potential_uturn = True
+            follow_blue = True
+            print(f"Potential U-turn detected! Following blue cones ({blue_only_count} blue, {yellow_only_count} yellow)")
+        
+        # If following one color in a U-turn, create a path that hugs the curve of the visible cones
+        if potential_uturn:
+            if follow_yellow and self.yellow_boundary:
+                # Create a path that follows the yellow boundary closely
+                for x, depth in self.yellow_boundary:
+                    # Stay a fixed distance to the right of yellow cones
+                    # Use just the safety margin (closer than before)
+                    adjusted_x = x - self.safety_margin
+                    waypoints.append((adjusted_x, depth))
+                    print(f"U-turn: Hugging yellow cone at ({x:.2f}, {depth:.2f}) with offset {self.safety_margin:.2f}m")
+                
+                # Make sure waypoints are sorted by depth
+                waypoints.sort(key=lambda p: p[1])
+                
+                # Calculate and smooth the path curvature
+                self._smooth_boundary_path(waypoints, "yellow")
+                
+            elif follow_blue and self.blue_boundary:
+                # Create a path that follows the blue boundary closely
+                for x, depth in self.blue_boundary:
+                    # Stay a fixed distance to the left of blue cones
+                    # Use just the safety margin (closer than before)
+                    adjusted_x = x + self.safety_margin
+                    waypoints.append((adjusted_x, depth))
+                    print(f"U-turn: Hugging blue cone at ({x:.2f}, {depth:.2f}) with offset {self.safety_margin:.2f}m")
+                
+                # Make sure waypoints are sorted by depth
+                waypoints.sort(key=lambda p: p[1])
+                
+                # Calculate and smooth the path curvature
+                self._smooth_boundary_path(waypoints, "blue")
+            
+            else:
+                # Process the cone pairs in the standard way as fallback
+                self._process_cone_pairs_for_path(waypoints, potential_uturn, follow_yellow, follow_blue)
+        else:
+            # Not in a U-turn, process cone pairs normally
+            self._process_cone_pairs_for_path(waypoints, potential_uturn, follow_yellow, follow_blue)
+        
+        # Add point at car position for continuity
+        waypoints.insert(0, (0.0, 0.5))
+        
+        # Ensure waypoints are sorted by depth
+        waypoints.sort(key=lambda p: p[1])
+        
+        # Store as path
+        self.path = waypoints
+        
+        print(f"Created compatible path with {len(self.path)} points")
+
+    def _smooth_boundary_path(self, waypoints, side):
+        """
+        Smooth the path that follows a boundary to create a natural curve.
+        
+        Args:
+            waypoints: List of waypoints to smooth
+            side: Which side the path is following ("yellow" or "blue")
+        """
+        if len(waypoints) <= 2:
+            return  # Not enough points to smooth
+        
+        # Copy original waypoints for reference
+        original_waypoints = waypoints.copy()
+        
+        # Sort by depth to ensure order
+        original_waypoints.sort(key=lambda p: p[1])
+        
+        # Clear the current waypoints
+        waypoints.clear()
+        
+        # Add first point
+        waypoints.append(original_waypoints[0])
+        
+        # If we have enough points, calculate a smooth curve
+        if len(original_waypoints) >= 3:
+            # Add intermediate points with smoothing
+            for i in range(1, len(original_waypoints)-1):
+                prev_pt = original_waypoints[i-1]
+                curr_pt = original_waypoints[i]
+                next_pt = original_waypoints[i+1]
+                
+                # Calculate the average position for smoothing
+                smooth_x = (prev_pt[0] + curr_pt[0] + next_pt[0]) / 3.0
+                
+                # Only smooth x-coordinate (lateral position), keep original depth
+                waypoints.append((smooth_x, curr_pt[1]))
+                
+                # Add extra interpolated points for smoother curves
+                # This helps the car follow the curve more naturally
+                mid_depth1 = (prev_pt[1] + curr_pt[1]) / 2
+                mid_depth2 = (curr_pt[1] + next_pt[1]) / 2
+                
+                # Calculate interpolated x values
+                k1 = (curr_pt[1] - prev_pt[1]) / (curr_pt[1] - prev_pt[1] + 1e-6)  # Avoid division by zero
+                k2 = (next_pt[1] - curr_pt[1]) / (next_pt[1] - curr_pt[1] + 1e-6)  # Avoid division by zero
+                
+                mid_x1 = prev_pt[0] + k1 * (curr_pt[0] - prev_pt[0])
+                mid_x2 = curr_pt[0] + k2 * (next_pt[0] - curr_pt[0])
+                
+                # Add interpolated points
+                if i == 1:  # Only add before point for first segment
+                    waypoints.append((mid_x1, mid_depth1))
+                
+                waypoints.append((mid_x2, mid_depth2))
+        
+        # Add last point
+        waypoints.append(original_waypoints[-1])
+        
+        # Sort again by depth to ensure order after smoothing
+        waypoints.sort(key=lambda p: p[1])
+
+    def _process_cone_pairs_for_path(self, waypoints, potential_uturn, follow_yellow, follow_blue):
+        """
+        Process cone pairs to generate path waypoints.
+        
+        Args:
+            waypoints: List to store the generated waypoints
+            potential_uturn: Whether a potential U-turn is detected
+            follow_yellow: Whether to follow yellow cones in a U-turn
+            follow_blue: Whether to follow blue cones in a U-turn
+        """
+        # Process each cone pair
+        for pair in self.cone_pairs:
+            # Both cones visible - use standard approach
+            if pair.yellow is not None and pair.blue is not None:
+                # Standard case: adjust midpoint with safety margins
+                yellow_x, blue_x = pair.yellow.x, pair.blue.x
+                
+                # Ensure we're not too close to either cone
+                if yellow_x > blue_x:  # Normal case: yellow on left, blue on right
+                    adjusted_yellow_x = yellow_x - self.safety_margin
+                    adjusted_blue_x = blue_x + self.safety_margin
+                else:  # Reversed case: blue on left, yellow on right
+                    adjusted_yellow_x = yellow_x + self.safety_margin
+                    adjusted_blue_x = blue_x - self.safety_margin
+                
+                # Check if there's still space between cones after applying margins
+                if (yellow_x > blue_x and adjusted_yellow_x > adjusted_blue_x) or \
+                (yellow_x < blue_x and adjusted_yellow_x < adjusted_blue_x):
+                    # Calculate safe midpoint
+                    adjusted_midpoint_x = (adjusted_yellow_x + adjusted_blue_x) / 2
+                    waypoints.append((adjusted_midpoint_x, pair.midpoint[1]))
+                else:
+                    # Not enough space - use original midpoint
+                    waypoints.append((pair.midpoint[0], pair.midpoint[1]))
+                    print(f"Warning: Not enough space for safety margin at depth {pair.midpoint[1]:.2f}m")
+            else:
+                # Only one cone visible - handle based on U-turn detection
+                if potential_uturn:
+                    if follow_yellow and pair.yellow is not None:
+                        # Following yellow cones in a U-turn - stay closer to yellow cones
+                        # Just use safety margin to hug the cone closely
+                        adjusted_x = pair.yellow.x - self.safety_margin
+                        waypoints.append((adjusted_x, pair.yellow.depth))
+                        print(f"U-turn: Hugging yellow cone at ({pair.yellow.x:.2f}, {pair.yellow.depth:.2f})")
+                    
+                    elif follow_blue and pair.blue is not None:
+                        # Following blue cones in a U-turn - stay closer to blue cones
+                        # Just use safety margin to hug the cone closely
+                        adjusted_x = pair.blue.x + self.safety_margin
+                        waypoints.append((adjusted_x, pair.blue.depth))
+                        print(f"U-turn: Hugging blue cone at ({pair.blue.x:.2f}, {pair.blue.depth:.2f})")
+                    
+                    # If we're following one color but have the other, include it with standard safety margin
+                    elif follow_yellow and pair.blue is not None:
+                        adjusted_x = pair.blue.x + self.safety_margin
+                        waypoints.append((adjusted_x, pair.blue.depth))
+                    elif follow_blue and pair.yellow is not None:
+                        adjusted_x = pair.yellow.x - self.safety_margin
+                        waypoints.append((adjusted_x, pair.yellow.depth))
+                else:
+                    # Standard single-cone handling (no U-turn)
+                    if pair.yellow is not None:
+                        # Yellow cone (left) - move right by safety margin
+                        adjusted_x = pair.midpoint[0] - self.safety_margin 
+                        waypoints.append((adjusted_x, pair.midpoint[1]))
+                    elif pair.blue is not None:
+                        # Blue cone (right) - move left by safety margin
+                        adjusted_x = pair.midpoint[0] + self.safety_margin
+                        waypoints.append((adjusted_x, pair.midpoint[1]))
     
     def calculate_steering(self, lookahead_distance=4.0, steering_gain=1.0, max_steering_angle=30.0):
-        """Calculate steering based on the planned path.
+        """
+        Calculate steering based on the planned path with improved U-turn handling.
         
         Args:
             lookahead_distance (float): Distance ahead to look for target point (in meters)
             steering_gain (float): Multiplier for steering sensitivity
             max_steering_angle (float): Maximum steering angle in degrees
-        """
-        if self.path is None or len(self.path) < 2:
-            return 0.0
-        
-        # Find point at lookahead distance
-        cumulative_dist = 0.0
-        target_idx = 0
-        
-        for i in range(1, len(self.path)):
-            x1, y1 = self.path[i-1]
-            x2, y2 = self.path[i]
-            segment_length = np.sqrt((x2-x1)**2 + (y2-y1)**2)
-            cumulative_dist += segment_length
-            
-            if cumulative_dist >= lookahead_distance:
-                target_idx = i
-                break
-        
-        if target_idx > 0:
-            # Get target point
-            target_x, target_y = self.path[target_idx]
-            
-            # Calculate angle to target point (from car's perspective)
-            angle = np.arctan2(target_x, target_y)
-            
-            # Apply steering gain
-            angle *= steering_gain
-            
-            # Normalize steering angle to range [-1, 1]
-            max_steering_rad = np.radians(max_steering_angle)
-            normalized_steering = np.clip(angle / max_steering_rad, -1.0, 1.0)
-            
-            return normalized_steering
-        
-        return 0.0  # Default: go straight
-    
-    def _pair_cones(self, cones, depths, min_track_width=2.0, max_track_width=6.0, depth_step=0.3):
-        """Improved cone pairing with better gap handling."""
-        # Separate yellow and blue cones
-        yellow_cones = [(c, d) for c, d in zip(cones, depths) if c[2] == 0]
-        blue_cones = [(c, d) for c, d in zip(cones, depths) if c[2] == 1]
-        
-        print(f"Yellow cones: {len(yellow_cones)}, Blue cones: {len(blue_cones)}")
-        
-        # Convert to world coordinates using depth
-        yellow_world = []
-        for cone, depth in yellow_cones:
-            center_x = cone[0]
-            # Calculate angle from image center
-            angle = ((center_x - self.image_width / 2) / (self.image_width / 2)) * (self.fov_horizontal / 2)
-            # Calculate world X coordinate
-            world_x = depth * np.tan(np.radians(angle))
-            # Store as (x, depth) coordinates in meters
-            yellow_world.append((world_x, depth))
-        
-        blue_world = []
-        for cone, depth in blue_cones:
-            center_x = cone[0]
-            angle = ((center_x - self.image_width / 2) / (self.image_width / 2)) * (self.fov_horizontal / 2)
-            world_x = depth * np.tan(np.radians(angle))
-            blue_world.append((world_x, depth))
-        
-        # Sort by depth
-        yellow_world.sort(key=lambda p: p[1])
-        blue_world.sort(key=lambda p: p[1])
-        
-        # Calculate track width from actual cone positions
-        track_widths = []
-        for y_pos in yellow_world:
-            for b_pos in blue_world:
-                # Find cones at similar depths
-                if abs(y_pos[1] - b_pos[1]) < 2.0:
-                    width = abs(y_pos[0] - b_pos[0])
-                    # Reasonable width check
-                    if min_track_width < width < max_track_width:
-                        track_widths.append(width)
-        
-        # Use median track width if available, otherwise use default
-        track_width = np.median(track_widths) if track_widths else 3.5
-        print(f"Calculated track width: {track_width:.2f}m")
-        
-        # Initialize waypoints at car position
-        waypoints = [(0.0, 0.5)]  # Start at car position
-        
-        # Store the last valid boundary positions to handle gaps
-        last_valid_yellow_pos = None
-        last_valid_blue_pos = None
-        
-        # Track the last observed trend for each boundary
-        yellow_trend = 0.0  # Direction of yellow boundary movement
-        blue_trend = 0.0    # Direction of blue boundary movement
-        
-        # Store the last 3 yellow and blue cones for better trend analysis
-        recent_yellow = []
-        recent_blue = []
-        
-        # Set a limit for extrapolation - if we haven't seen cones for this distance, stop extrapolating
-        max_extrapolation_distance = 10.0  # meters
-        
-        # Find maximum detected cone depth
-        max_depth = 15.0  # Default maximum depth
-        if yellow_world:
-            max_depth = max(max_depth, max(y[1] for y in yellow_world))
-        if blue_world:
-            max_depth = max(max_depth, max(b[1] for b in blue_world))
-        
-        # Sample depths at higher resolution for better path continuity
-        depths = np.arange(0.5, min(max_depth + 3.0, 20.0), depth_step)
-        
-        # Generate waypoints at each depth
-        for depth in depths:
-            # Find closest yellow and blue cones at this depth
-            closest_yellow = None
-            closest_blue = None
-            best_y_dist = float('inf')
-            best_b_dist = float('inf')
-            
-            for y_pos in yellow_world:
-                dist = abs(y_pos[1] - depth)
-                if dist < best_y_dist and dist < 3.0:  # Within 3m
-                    best_y_dist = dist
-                    closest_yellow = y_pos
-            
-            for b_pos in blue_world:
-                dist = abs(b_pos[1] - depth)
-                if dist < best_b_dist and dist < 3.0:  # Within 3m
-                    best_b_dist = dist
-                    closest_blue = b_pos
-            
-            # Update recent cone lists for better trend analysis
-            if closest_yellow is not None:
-                recent_yellow.append(closest_yellow)
-                if len(recent_yellow) > 3:
-                    recent_yellow.pop(0)
-                last_valid_yellow_pos = closest_yellow
-                
-                # Calculate yellow trend if we have enough points
-                if len(recent_yellow) >= 2:
-                    # Sort by depth to ensure correct ordering
-                    sorted_recent = sorted(recent_yellow, key=lambda p: p[1])
-                    # Calculate average rate of lateral change
-                    lateral_changes = [(sorted_recent[i][0] - sorted_recent[i-1][0]) / 
-                                      max(0.1, sorted_recent[i][1] - sorted_recent[i-1][1])
-                                      for i in range(1, len(sorted_recent))]
-                    yellow_trend = sum(lateral_changes) / len(lateral_changes)
-            
-            if closest_blue is not None:
-                recent_blue.append(closest_blue)
-                if len(recent_blue) > 3:
-                    recent_blue.pop(0)
-                last_valid_blue_pos = closest_blue
-                
-                # Calculate blue trend
-                if len(recent_blue) >= 2:
-                    sorted_recent = sorted(recent_blue, key=lambda p: p[1])
-                    lateral_changes = [(sorted_recent[i][0] - sorted_recent[i-1][0]) / 
-                                      max(0.1, sorted_recent[i][1] - sorted_recent[i-1][1])
-                                      for i in range(1, len(sorted_recent))]
-                    blue_trend = sum(lateral_changes) / len(lateral_changes)
-            
-            # Handle yellow boundary gaps with improved extrapolation
-            if closest_yellow is None and last_valid_yellow_pos is not None:
-                # Check if we're within valid extrapolation range
-                gap_distance = depth - last_valid_yellow_pos[1]
-                if gap_distance <= max_extrapolation_distance:
-                    # Calculate extrapolated position with better trend analysis
-                    extrapolated_x = last_valid_yellow_pos[0] + yellow_trend * gap_distance
-                    
-                    # Apply non-linear adjustment for corners (make turns more aggressive)
-                    if abs(yellow_trend) > 0.1:  # If we're in a turn
-                        # Add quadratic component for sharper turns
-                        sign = 1 if yellow_trend > 0 else -1
-                        extrapolated_x += sign * 0.05 * gap_distance**2
-                    
-                    closest_yellow = (extrapolated_x, depth)
-                    print(f"Extrapolated yellow cone at depth {depth:.1f}m: x={extrapolated_x:.2f}m (trend: {yellow_trend:.2f})")
-            
-            # Handle blue boundary gaps with similar improvements
-            if closest_blue is None and last_valid_blue_pos is not None:
-                gap_distance = depth - last_valid_blue_pos[1]
-                if gap_distance <= max_extrapolation_distance:
-                    extrapolated_x = last_valid_blue_pos[0] + blue_trend * gap_distance
-                    
-                    # Apply non-linear adjustment for corners
-                    if abs(blue_trend) > 0.1:
-                        sign = 1 if blue_trend > 0 else -1
-                        extrapolated_x += sign * 0.05 * gap_distance**2
-                        
-                    closest_blue = (extrapolated_x, depth)
-                    print(f"Extrapolated blue cone at depth {depth:.1f}m: x={extrapolated_x:.2f}m (trend: {blue_trend:.2f})")
-            
-            # Generate waypoint based on available cones or extrapolations
-            if closest_yellow is not None and closest_blue is not None:
-                # Both colors available - find midpoint
-                midpoint_x = (closest_yellow[0] + closest_blue[0]) / 2
-                waypoints.append((midpoint_x, depth))
-            elif closest_yellow is not None:
-                # Only yellow - estimate blue position based on track width and yellow trend
-                # If we're turning, adjust the estimated track width
-                adjusted_width = track_width
-                if abs(yellow_trend) > 0.1:  # We're in a turn
-                    # Reduce track width slightly in turns
-                    adjusted_width = track_width * (1.0 - min(0.2, abs(yellow_trend) * 0.5))
-                
-                estimated_blue_x = closest_yellow[0] - adjusted_width
-                midpoint_x = (closest_yellow[0] + estimated_blue_x) / 2
-                waypoints.append((midpoint_x, depth))
-            elif closest_blue is not None:
-                # Only blue - estimate yellow with similar adjustments
-                adjusted_width = track_width
-                if abs(blue_trend) > 0.1:
-                    adjusted_width = track_width * (1.0 - min(0.2, abs(blue_trend) * 0.5))
-                
-                estimated_yellow_x = closest_blue[0] + adjusted_width
-                midpoint_x = (estimated_yellow_x + closest_blue[0]) / 2
-                waypoints.append((midpoint_x, depth))
-            else:
-                # No cones at this depth and no valid extrapolation
-                # If we have waypoints already, continue trend with extra caution
-                if len(waypoints) >= 2:
-                    # Use the last few waypoints to determine trend
-                    last_points = waypoints[-3:] if len(waypoints) >= 3 else waypoints[-2:]
-                    
-                    # Calculate average lateral change
-                    if len(last_points) >= 2:
-                        x_diffs = [last_points[i][0] - last_points[i-1][0] for i in range(1, len(last_points))]
-                        y_diffs = [last_points[i][1] - last_points[i-1][1] for i in range(1, len(last_points))]
-                        
-                        # Calculate average rate of change if possible
-                        if any(y > 0.001 for y in y_diffs):
-                            rates = [x/y for x, y in zip(x_diffs, y_diffs) if y > 0.001]
-                            if rates:
-                                avg_rate = sum(rates) / len(rates)
-                                
-                                # Apply a damping factor - be more conservative with extrapolation
-                                damping = 0.7  # Reduce extrapolation aggressiveness
-                                damped_rate = avg_rate * damping
-                                
-                                # Calculate new position
-                                last_x, last_y = waypoints[-1]
-                                extrapolated_x = last_x + damped_rate * (depth - last_y)
-                                
-                                # Limit the deviation from forward path
-                                max_deviation = 3.0  # meters
-                                extrapolated_x = max(min(extrapolated_x, max_deviation), -max_deviation)
-                                
-                                waypoints.append((extrapolated_x, depth))
-                                continue
-                    
-                    # Fallback: continue straight with slight convergence to center
-                    last_x = waypoints[-1][0]
-                    convergence_factor = 0.05  # Gradually return to center
-                    waypoints.append((last_x * (1.0 - convergence_factor), depth))
-                else:
-                    # With no history, continue straight
-                    waypoints.append((0.0, depth))
-        
-        return waypoints
-    
-    def _smooth_path(self, x_coords, y_coords, smoothing_factor=0.1, num_points=100):
-        """Smooth path using cubic spline interpolation.
-        
-        Args:
-            x_coords (list): List of x coordinates
-            y_coords (list): List of y coordinates
-            smoothing_factor (float): Smoothing factor for spline (0 = no smoothing)
-            num_points (int): Number of points in smoothed path
             
         Returns:
-            tuple: (smoothed_x, smoothed_y) coordinates
+            float: Normalized steering angle in range [-1, 1]
         """
-        if len(x_coords) < 3:
-            return x_coords, y_coords
-        
-        # Convert to numpy arrays
-        x_coords = np.array(x_coords)
-        y_coords = np.array(y_coords)
-        
-        # Sort by y-coordinate (depth)
-        indices = np.argsort(y_coords)
-        x_coords = x_coords[indices]
-        y_coords = y_coords[indices]
-        
-        # Create cubic spline
         try:
-            spline = CubicSpline(y_coords, x_coords, bc_type='natural')
+            # Adjust lookahead distance for U-turns
+            if hasattr(self, 'in_uturn') and self.in_uturn:
+                # Use a shorter lookahead in U-turns for tighter turning
+                u_turn_lookahead = min(lookahead_distance, 2.5)  # Shorter lookahead in U-turns
+                print(f"U-turn: Reducing lookahead from {lookahead_distance}m to {u_turn_lookahead}m")
+                lookahead_distance = u_turn_lookahead
             
-            # Generate evenly spaced y-coordinates
-            y_smooth = np.linspace(y_coords[0], y_coords[-1], num_points)
+            # Update lookahead distance if different
+            if lookahead_distance != self.lookahead_distance:
+                self.lookahead_distance = lookahead_distance
+                self._find_target_point()
+                self._calculate_steering()
+                self._smooth_steering()
             
-            # Evaluate spline at new points
-            x_smooth = spline(y_smooth)
+            # Adjust steering for tighter U-turns
+            if hasattr(self, 'in_uturn') and self.in_uturn:
+                # Increase steering amplitude in U-turns
+                u_turn_gain = 1.3  # Higher gain for more aggressive steering in U-turns
+                old_steering = self.steering_angle
+                self.steering_angle = np.clip(self.steering_angle * u_turn_gain, -1.0, 1.0)
+                print(f"U-turn: Increasing steering from {old_steering:.2f} to {self.steering_angle:.2f}")
             
-            # Apply additional smoothing if needed
-            if smoothing_factor > 0:
-                window_size = int(len(x_smooth) * smoothing_factor)
-                if window_size > 1:
-                    x_smooth = np.convolve(x_smooth, np.ones(window_size)/window_size, mode='same')
+            # Always visualize when called
+            if self.visualize and hasattr(self.zed_camera, 'rgb_image') and self.zed_camera.rgb_image is not None:
+                try:
+                    self.debug_image = self.draw_path(self.zed_camera.rgb_image.copy())
+                    cv2.imshow("Pure Pursuit Path", self.debug_image)
+                    cv2.waitKey(1)
+                except Exception as e:
+                    print(f"Warning: Visualization failed: {str(e)}")
             
-            return x_smooth, y_smooth
-            
+            return self.steering_angle
         except Exception as e:
-            print(f"Error in path smoothing: {e}")
-            return x_coords, y_coords
+            print(f"Error calculating steering: {str(e)}")
+            return 0.0  # Safe default
     
-    def _smooth_path_temporally(self, new_path):
-        """Blend the new path with the previous path to reduce sudden jumps."""
-        if self.previous_path is None or len(self.previous_path) != len(new_path):
-            self.previous_path = new_path
-            return new_path
-        
-        alpha = 0.7  # Smoothing factor (0 = use previous path, 1 = use new path)
-        smoothed_path = []
-        for (new_x, new_y), (prev_x, prev_y) in zip(new_path, self.previous_path):
-            smoothed_x = alpha * new_x + (1 - alpha) * prev_x
-            smoothed_y = alpha * new_y + (1 - alpha) * prev_y
-            smoothed_path.append((smoothed_x, smoothed_y))
-        
-        self.previous_path = smoothed_path
-        return smoothed_path
-    
-    def plan_path(self):
-        try:
-            if not self.zed_camera.cone_detections:
-                print("No cone detections available")
-                self.path = None
-                return
-            
-            cones = []
-            depths = []
-            for detection in self.zed_camera.cone_detections:
-                x1, y1, x2, y2 = detection['box']
-                cls = detection['cls']
-                depth = detection['depth']
-                print(f"Using cone: Class = {cls}, Depth = {depth:.2f}m, Box = ({x1}, {y1}, {x2}, {y2})")
-                cones.append((x1, y1, x2, y2, cls))
-                depths.append(depth)
-            
-            print(f"Using {len(cones)} detected cones from zed_2i.py")
-            
-            filtered_cones, filtered_depths = self._filter_cones(cones, depths)
-            if not filtered_cones:
-                print("No cones after filtering")
-                self.path = None
-                return
-            
-            yellow_cones = [(c, d) for c, d in zip(filtered_cones, filtered_depths) if c[2] == 0]
-            blue_cones = [(c, d) for c, d in zip(filtered_cones, filtered_depths) if c[2] == 1]
-            print(f"Yellow cones: {len(yellow_cones)}, Blue cones: {len(blue_cones)}")
-            
-            waypoints = self._pair_cones(filtered_cones, filtered_depths)
-            
-            if waypoints:
-                x_coords, y_coords = zip(*waypoints)
-                smoothed_x, smoothed_y = self._smooth_path(x_coords, y_coords)
-                new_path = list(zip(smoothed_x, smoothed_y))
-                
-                # Apply temporal smoothing
-                new_path = self._smooth_path_temporally(new_path)
-                
-                # Sort the path by depth to ensure smooth drawing
-                new_path.sort(key=lambda p: p[1])
-                self.path = new_path
-                
-                print(f"Path successfully created with {len(self.path)} points!")
-            else:
-                print("No waypoints found")
-                self.path = None
-                
-        except Exception as e:
-            print(f"Error in path planning: {e}")
-            self.path = None
+    def get_path(self):
+        """Get the current path (for compatibility with original code)."""
+        return self.path
     
     def draw_path(self, image):
-        if not self.visualize or self.path is None or len(self.path) < 2:
-            return image
+        """
+        Draw the planned path with U-turn detection visualization.
         
+        Args:
+            image: Input image for visualization
+            
+        Returns:
+            Image with visualization overlays
+        """
+        if image is None:
+            # Create a blank image if none provided
+            image = np.zeros((self.image_height, self.image_width, 3), dtype=np.uint8)
+        
+        # Create a copy of the image
+        viz_image = image.copy()
+        
+        # Detect potential U-turn for visualization
+        yellow_only_count = sum(1 for pair in self.cone_pairs if pair.yellow is not None and pair.blue is None)
+        blue_only_count = sum(1 for pair in self.cone_pairs if pair.blue is not None and pair.yellow is None)
+        
+        # Determine if we're in a potential U-turn (mostly seeing one color)
+        in_uturn = False
+        uturn_side = "none"
+        if yellow_only_count > 1 and yellow_only_count > blue_only_count:
+            in_uturn = True
+            uturn_side = "yellow"
+        elif blue_only_count > 1 and blue_only_count > yellow_only_count:
+            in_uturn = True
+            uturn_side = "blue"
+        
+        # Draw car indicator at bottom center of image
         car_x = self.image_width // 2
         car_y = self.image_height - 20
         
-        # Draw car indicator
+        # Draw car triangle
         car_points = np.array([
             [car_x, car_y - 10],
             [car_x - 10, car_y + 10],
             [car_x + 10, car_y + 10]
         ], dtype=np.int32)
-        cv2.fillPoly(image, [car_points], (0, 255, 255))
+        cv2.fillPoly(viz_image, [car_points], (0, 255, 255))
         
-        # Improved depth-to-pixel mapping function
-        def depth_to_pixel_y(depth):
-            # Non-linear mapping for better perspective
-            if depth <= 1.0:
-                # Close points (linear mapping for close range)
-                y = int(car_y - (depth / 1.0) * 60)
-            else:
-                # Far points (non-linear mapping for better perspective)
-                y = int(car_y - 60 - ((depth - 1.0) ** 0.85) * 40)
-            
-            return max(0, min(y, self.image_height - 1))
-        
-        # Convert path points to image coordinates
-        path_pixels = [(car_x, car_y)]  # Start at car position
-        
-        for world_x, world_y in self.path:
+        # Helper function to convert world coords to image coords
+        def world_to_image(x, depth):
             # Convert lateral position to image x-coordinate
-            angle = np.arctan2(world_x, world_y)
-            pixel_x = int(car_x + (angle / np.radians(self.fov_horizontal / 2)) * 
-                         (self.image_width / 2))
+            angle = np.arctan2(x, depth)
+            px = int(car_x + (angle / np.radians(self.fov_horizontal / 2)) * (self.image_width / 2))
             
-            # Convert depth to image y-coordinate using our improved mapping
-            pixel_y = depth_to_pixel_y(world_y)
+            # Convert depth to image y-coordinate (non-linear mapping for perspective)
+            if depth <= 1.0:
+                py = int(car_y - (depth / 1.0) * 60)
+            else:
+                py = int(car_y - 60 - ((depth - 1.0) ** 0.85) * 40)
             
-            path_pixels.append((pixel_x, pixel_y))
+            return max(0, min(px, self.image_width - 1)), max(0, min(py, self.image_height - 1))
         
-        # Draw path with visual enhancements
+        # Draw cone pairs
+        for i, pair in enumerate(self.cone_pairs):
+            # Draw pair midpoint
+            mid_x, mid_depth = pair.midpoint
+            mid_px, mid_py = world_to_image(mid_x, mid_depth)
+            
+            # Color gradient based on distance
+            ratio = i / max(1, len(self.cone_pairs) - 1)
+            if ratio < 0.5:
+                color = (0, int(255 * ratio * 2), 255)  # Blue -> Cyan
+            else:
+                color = (0, 255, int(255 * (1 - (ratio - 0.5) * 2)))  # Cyan -> Green
+                    
+            cv2.circle(viz_image, (mid_px, mid_py), 5, color, -1)
+            
+            # Draw line connecting cone pair
+            if pair.yellow is not None and pair.blue is not None:
+                y_px, y_py = world_to_image(pair.yellow.x, pair.yellow.depth)
+                b_px, b_py = world_to_image(pair.blue.x, pair.blue.depth)
+                
+                # Draw yellow cone
+                cv2.circle(viz_image, (y_px, y_py), 4, (0, 255, 255), -1)
+                
+                # Draw blue cone
+                cv2.circle(viz_image, (b_px, b_py), 4, (255, 0, 0), -1)
+                
+                # Draw track boundary between the gate
+                cv2.line(viz_image, (y_px, y_py), (b_px, b_py), (255, 255, 255), 1)
+            else:
+                # Only one cone in the pair - draw larger with highlighted border if in U-turn
+                if pair.yellow is not None:
+                    y_px, y_py = world_to_image(pair.yellow.x, pair.yellow.depth)
+                    # Special highlight for cones being followed in U-turn
+                    if in_uturn and uturn_side == "yellow":
+                        # Draw larger highlighted cone
+                        cv2.circle(viz_image, (y_px, y_py), 7, (0, 0, 0), -1)  # Black background
+                        cv2.circle(viz_image, (y_px, y_py), 6, (0, 255, 255), -1)  # Yellow cone
+                        cv2.circle(viz_image, (y_px, y_py), 3, (255, 255, 255), -1)  # White center
+                    else:
+                        # Regular yellow cone
+                        cv2.circle(viz_image, (y_px, y_py), 4, (0, 255, 255), -1)
+                
+                if pair.blue is not None:
+                    b_px, b_py = world_to_image(pair.blue.x, pair.blue.depth)
+                    # Special highlight for cones being followed in U-turn
+                    if in_uturn and uturn_side == "blue":
+                        # Draw larger highlighted cone
+                        cv2.circle(viz_image, (b_px, b_py), 7, (0, 0, 0), -1)  # Black background
+                        cv2.circle(viz_image, (b_px, b_py), 6, (255, 0, 0), -1)  # Blue cone
+                        cv2.circle(viz_image, (b_px, b_py), 3, (255, 255, 255), -1)  # White center
+                    else:
+                        # Regular blue cone
+                        cv2.circle(viz_image, (b_px, b_py), 4, (255, 0, 0), -1)
+        
+        # Draw connected boundary cones (yellow side)
+        yellow_pixels = []
+        for x, depth in self.yellow_boundary:
+            px, py = world_to_image(x, depth)
+            yellow_pixels.append((px, py))
+            # Yellow cones are drawn by the cone pair loop above
+        
+        # Draw connected boundary cones (blue side)
+        blue_pixels = []
+        for x, depth in self.blue_boundary:
+            px, py = world_to_image(x, depth)
+            blue_pixels.append((px, py))
+            # Blue cones are drawn by the cone pair loop above
+        
+        # Draw connected yellow boundary line
+        if len(yellow_pixels) >= 2:
+            for i in range(len(yellow_pixels) - 1):
+                # Highlight yellow boundary in U-turn case
+                if in_uturn and uturn_side == "yellow":
+                    cv2.line(viz_image, yellow_pixels[i], yellow_pixels[i + 1], (0, 255, 255), 3)  # Thicker line
+                else:
+                    cv2.line(viz_image, yellow_pixels[i], yellow_pixels[i + 1], (0, 255, 255), 2)
+        
+        # Draw connected blue boundary line
+        if len(blue_pixels) >= 2:
+            for i in range(len(blue_pixels) - 1):
+                # Highlight blue boundary in U-turn case
+                if in_uturn and uturn_side == "blue":
+                    cv2.line(viz_image, blue_pixels[i], blue_pixels[i + 1], (255, 0, 0), 3)  # Thicker line
+                else:
+                    cv2.line(viz_image, blue_pixels[i], blue_pixels[i + 1], (255, 0, 0), 2)
+        
+        # Add safety margin visualization
+        if hasattr(self, 'safety_margin') and self.safety_margin > 0:
+            # Draw yellow boundary with safety margin
+            yellow_safe = []
+            for x, depth in self.yellow_boundary:
+                # Move right by safety margin
+                safe_x = x - self.safety_margin
+                px, py = world_to_image(safe_x, depth)
+                yellow_safe.append((px, py))
+            
+            # Draw blue boundary with safety margin
+            blue_safe = []
+            for x, depth in self.blue_boundary:
+                # Move left by safety margin
+                safe_x = x + self.safety_margin
+                px, py = world_to_image(safe_x, depth)
+                blue_safe.append((px, py))
+            
+            # Draw safety margin boundaries with dotted lines (compatible with older OpenCV versions)
+            if len(yellow_safe) >= 2:
+                for i in range(len(yellow_safe) - 1):
+                    # Draw dotted line by creating small segments
+                    pt1 = yellow_safe[i]
+                    pt2 = yellow_safe[i + 1]
+                    dx = pt2[0] - pt1[0]
+                    dy = pt2[1] - pt1[1]
+                    dist = max(1, int(np.sqrt(dx*dx + dy*dy)))
+                    
+                    # Create dots every 5 pixels
+                    for j in range(0, dist, 10):
+                        x = int(pt1[0] + j * dx / dist)
+                        y = int(pt1[1] + j * dy / dist)
+                        cv2.circle(viz_image, (x, y), 1, (0, 160, 160), -1)
+            
+            if len(blue_safe) >= 2:
+                for i in range(len(blue_safe) - 1):
+                    # Draw dotted line by creating small segments
+                    pt1 = blue_safe[i]
+                    pt2 = blue_safe[i + 1]
+                    dx = pt2[0] - pt1[0]
+                    dy = pt2[1] - pt1[1]
+                    dist = max(1, int(np.sqrt(dx*dx + dy*dy)))
+                    
+                    # Create dots every 5 pixels
+                    for j in range(0, dist, 10):
+                        x = int(pt1[0] + j * dx / dist)
+                        y = int(pt1[1] + j * dy / dist)
+                        cv2.circle(viz_image, (x, y), 1, (160, 0, 0), -1)
+            
+            # If in U-turn, draw additional turning radius visualization
+            if in_uturn:
+                # Calculate an approximate turning circle
+                turn_radius = self.default_track_width * 1.5  # Approximate turning radius
+                if uturn_side == "yellow" and self.yellow_boundary:
+                    # For yellow-side U-turn, get the innermost yellow cone
+                    innermost_yellow = min(self.yellow_boundary, key=lambda p: p[1])
+                    center_x = innermost_yellow[0] - turn_radius
+                    center_depth = innermost_yellow[1]
+                    center_px, center_py = world_to_image(center_x, center_depth)
+                    
+                    # Draw turning circle
+                    for angle in range(0, 181, 10):  # 0-180 degrees in 10 degree steps
+                        rad = np.radians(angle)
+                        x = center_x + turn_radius * np.cos(rad)
+                        y = center_depth + turn_radius * np.sin(rad)
+                        px, py = world_to_image(x, y)
+                        cv2.circle(viz_image, (px, py), 1, (0, 180, 180), -1)
+                
+                elif uturn_side == "blue" and self.blue_boundary:
+                    # For blue-side U-turn, get the innermost blue cone
+                    innermost_blue = min(self.blue_boundary, key=lambda p: p[1])
+                    center_x = innermost_blue[0] + turn_radius
+                    center_depth = innermost_blue[1]
+                    center_px, center_py = world_to_image(center_x, center_depth)
+                    
+                    # Draw turning circle
+                    for angle in range(0, 181, 10):  # 0-180 degrees in 10 degree steps
+                        rad = np.radians(angle)
+                        x = center_x - turn_radius * np.cos(rad)
+                        y = center_depth + turn_radius * np.sin(rad)
+                        px, py = world_to_image(x, y)
+                        cv2.circle(viz_image, (px, py), 1, (180, 0, 180), -1)
+        
+        # Draw path with visual enhancements (using original code's path display format)
+        path_pixels = []
+        if self.path:
+            for world_x, world_y in self.path:
+                px, py = world_to_image(world_x, world_y)
+                path_pixels.append((px, py))
+        
         if len(path_pixels) >= 2:
             # Draw outline first for better visibility
-            cv2.polylines(image, [np.array(path_pixels)], False, (0, 0, 0), 7)
+            cv2.polylines(viz_image, [np.array(path_pixels)], False, (0, 0, 0), 7)
             
             # Draw color gradient path
             for i in range(len(path_pixels) - 1):
@@ -617,506 +1238,154 @@ class PathPlanner:
                     r, g, b = int(255 * (1 - (ratio - 0.5) * 2)), 255, 0
                 
                 # Draw line segments
-                cv2.line(image, path_pixels[i], path_pixels[i + 1], (b, g, r), 4)
-                
-                # Add distance markers at intervals
-                if i % 10 == 0 and i > 0:
-                    x, y = path_pixels[i]
-                    depth = self.path[i][1]
-                    label = f"{depth:.1f}m"
-                    cv2.putText(image, label, (x + 5, y - 5), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                    cv2.circle(image, (x, y), 3, (255, 255, 255), -1)
-            
-            # Highlight steering target point
-            lookahead_distance = 5.0
-            target_idx = 0
-            for i, (_, depth) in enumerate(self.path):
-                if depth >= lookahead_distance:
-                    target_idx = i
-                    break
-            
-            if target_idx < len(path_pixels):
-                tx, ty = path_pixels[target_idx]
-                cv2.circle(image, (tx, ty), 8, (0, 0, 255), -1)
-                cv2.line(image, (car_x, car_y), (tx, ty), (0, 0, 255), 2)
-            
-            # Add path info text
-            path_info = f"Path: {len(self.path)} points, {self.path[-1][1]:.1f}m"
-            cv2.putText(image, path_info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                       0.7, (0, 255, 0), 2, cv2.LINE_AA)
-            
-            # Add steering info
-            steering = self.calculate_steering()
-            steer_text = f"Steering: {steering:.2f}"
-            cv2.putText(image, steer_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 
-                       0.7, (0, 255, 255), 2, cv2.LINE_AA)
+                cv2.line(viz_image, path_pixels[i], path_pixels[i + 1], (b, g, r), 4)
         
-        return image
+        # Draw target point with special marker
+        if self.target_point:
+            tx, td = self.target_point
+            tpx, tpy = world_to_image(tx, td)
+            
+            # Draw target circle 
+            cv2.circle(viz_image, (tpx, tpy), 8, (0, 0, 255), -1)
+            cv2.circle(viz_image, (tpx, tpy), 10, (255, 255, 255), 2)
+            
+            # Draw line from car to target
+            cv2.line(viz_image, (car_x, car_y), (tpx, tpy), (0, 0, 255), 2)
+            
+            # Label the target point
+            target_text = f"{td:.1f}m"
+            cv2.putText(viz_image, target_text, (tpx + 5, tpy - 5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        
+        # Add path info text
+        path_info = f"Path: {len(self.path) if self.path else 0} points" + (f", {self.path[-1][1]:.1f}m" if self.path and len(self.path) > 0 else "")
+        cv2.putText(viz_image, path_info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        
+        # Add steering info
+        steer_text = f"Steering: {self.steering_angle:.2f}"
+        cv2.putText(viz_image, steer_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 
+                0.7, (0, 255, 255), 2, cv2.LINE_AA)
+        
+        # Add U-turn status
+        if in_uturn:
+            uturn_text = f"U-TURN DETECTED: following {uturn_side} cones"
+            cv2.putText(viz_image, uturn_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (0, 0, 255), 2, cv2.LINE_AA)
+        else:
+            # Add pure pursuit info
+            pp_text = f"Safety margin: {self.safety_margin:.1f}m, Lookahead: {self.lookahead_distance:.1f}m"
+            cv2.putText(viz_image, pp_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.7, (0, 255, 255), 2, cv2.LINE_AA)
+        
+        return viz_image
+
+
+def plan_path_with_cones(self, cones, depths):
+    """
+    Plan a path using provided cone detections.
+    This maintains compatibility with the original interface.
     
-    def get_path(self):
-        return self.path
-
-    def plan_path_with_cones(self, cones, depths):
-        """
-        Plan a path using provided cone detections
-        
-        Args:
-            cones: List of (center_x, center_y, cls) tuples
-            depths: List of depth values for each cone
-        """
-        try:
-            if not cones:
-                print("No cone detections provided")
-                self.path = None
-                return
-            
-            print(f"Planning path with {len(cones)} provided cones")
-            
-            # Filter cones (if needed)
-            filtered_cones, filtered_depths = self._filter_cones(cones, depths)
-            if not filtered_cones:
-                print("No cones after filtering")
-                self.path = None
-                return
-            
-            # Generate waypoints from cones
-            waypoints = self._pair_cones(filtered_cones, filtered_depths)
-            
-            if waypoints:
-                x_coords, y_coords = zip(*waypoints)
-                smoothed_x, smoothed_y = self._smooth_path(x_coords, y_coords)
-                new_path = list(zip(smoothed_x, smoothed_y))
-                
-                # Apply temporal smoothing
-                new_path = self._smooth_path_temporally(new_path)
-                
-                # Sort the path by depth to ensure smooth drawing
-                new_path.sort(key=lambda p: p[1])
-                self.path = new_path
-                
-                print(f"Path successfully created with {len(self.path)} points!")
-            else:
-                print("No waypoints found")
-                self.path = None
-        
-        except Exception as e:
-            print(f"Error in path planning with cones: {e}")
-            import traceback
-            traceback.print_exc()
+    Args:
+        cones: List of (center_x, center_y, cls) tuples
+        depths: List of depth values for each cone
+    """
+    try:
+        if not cones:
+            print("No cone detections provided")
             self.path = None
-
-    def _limit_path_length(self, waypoints, max_distance=15.0, min_points=10):
-        """
-        Limit the path length to a reasonable distance to prevent overextension.
+            return
         
-        Args:
-            waypoints: List of (x, depth) waypoints
-            max_distance: Maximum forward distance in meters
-            min_points: Minimum number of points to keep
-            
-        Returns:
-            Limited waypoints
-        """
-        if not waypoints or len(waypoints) < min_points:
-            return waypoints
+        print(f"Planning path with {len(cones)} provided cones")
         
-        # Sort by depth
-        sorted_waypoints = sorted(waypoints, key=lambda p: p[1])
-        
-        # Keep points up to max_distance
-        limited_waypoints = [p for p in sorted_waypoints if p[1] <= max_distance]
-        
-        # Ensure we have at least min_points
-        if len(limited_waypoints) < min_points and len(sorted_waypoints) >= min_points:
-            limited_waypoints = sorted_waypoints[:min_points]
-        
-        # Add additional check for extrapolation reliability
-        # If the furthest points are based on extrapolation without actual cone detections,
-        # they might be less reliable, so adjust the curve to prevent extreme deviations
-        
-        if len(limited_waypoints) >= 3:
-            # Check the last few points for extreme lateral deviation
-            last_points = limited_waypoints[-3:]
-            lateral_changes = [abs(p2[0] - p1[0]) for p1, p2 in zip(last_points[:-1], last_points[1:])]
-            
-            # If there's significant lateral change in the last segments
-            if any(change > 1.0 for change in lateral_changes):
-                # Calculate average x-position from stable portion of the path
-                stable_portion = limited_waypoints[:-3]
-                if stable_portion:
-                    avg_x = sum(p[0] for p in stable_portion) / len(stable_portion)
-                    
-                    # Dampen extreme deviations in the last points
-                    damping_factor = 0.7  # Adjust based on testing
-                    for i in range(-3, 0):
-                        # Blend with average x to prevent extreme extrapolation
-                        current_x = limited_waypoints[i][0]
-                        limited_waypoints[i] = (
-                            damping_factor * current_x + (1 - damping_factor) * avg_x,
-                            limited_waypoints[i][1]
-                        )
-        
-        return limited_waypoints
-
-    def _add_cone_safety_margins(self, waypoints, yellow_world, blue_world, safety_margin=0.3):
-        """
-        Add safety margins around cones to avoid getting too close or hitting them.
-        
-        Args:
-            waypoints: List of (x, depth) waypoints
-            yellow_world: List of (x, depth) for yellow cones
-            blue_world: List of (x, depth) for blue cones
-            safety_margin: Safety margin in meters
-            
-        Returns:
-            Adjusted waypoints
-        """
-        if not waypoints or (not yellow_world and not blue_world):
-            return waypoints
-        
-        adjusted_waypoints = []
-        
-        for wp_x, wp_depth in waypoints:
-            # Find closest cones at this depth
-            closest_yellow = None
-            closest_blue = None
-            best_y_dist = float('inf')
-            best_b_dist = float('inf')
-            
-            # Find closest yellow cone
-            for y_x, y_depth in yellow_world:
-                dist = abs(y_depth - wp_depth)
-                if dist < best_y_dist:
-                    best_y_dist = dist
-                    closest_yellow = (y_x, y_depth)
-            
-            # Find closest blue cone
-            for b_x, b_depth in blue_world:
-                dist = abs(b_depth - wp_depth)
-                if dist < best_b_dist:
-                    best_b_dist = dist
-                    closest_blue = (b_x, b_depth)
-            
-            # Apply safety adjustments if cones are found
-            adjusted_x = wp_x
-            
-            # Only adjust if we have close cones (within 3 meters depth-wise)
-            if closest_yellow and best_y_dist < 3.0 and closest_blue and best_b_dist < 3.0:
-                # We have both cones - check if too close to either
-                y_x, _ = closest_yellow
-                b_x, _ = closest_blue
-                
-                # Calculate distances to the cones
-                dist_to_yellow = abs(wp_x - y_x)
-                dist_to_blue = abs(wp_x - b_x)
-                
-                # Assuming yellow is on left (positive X) and blue on right (negative X)
-                if dist_to_yellow < safety_margin:
-                    # Too close to yellow cone, adjust rightward
-                    adjusted_x = y_x - safety_margin
-                elif dist_to_blue < safety_margin:
-                    # Too close to blue cone, adjust leftward
-                    adjusted_x = b_x + safety_margin
-                    
-                # Track width sanity check
-                track_width = abs(y_x - b_x)
-                if track_width > 2.0:
-                    # Additional check to ensure we're still within the track
-                    if adjusted_x > y_x - safety_margin:
-                        adjusted_x = y_x - safety_margin
-                    elif adjusted_x < b_x + safety_margin:
-                        adjusted_x = b_x + safety_margin
-                
-            elif closest_yellow and best_y_dist < 3.0:
-                # Only yellow cone - ensure safety margin
-                y_x, _ = closest_yellow
-                if wp_x > y_x - safety_margin:
-                    adjusted_x = y_x - safety_margin
-                    
-            elif closest_blue and best_b_dist < 3.0:
-                # Only blue cone - ensure safety margin
-                b_x, _ = closest_blue
-                if wp_x < b_x + safety_margin:
-                    adjusted_x = b_x + safety_margin
-            
-            adjusted_waypoints.append((adjusted_x, wp_depth))
-        
-        return adjusted_waypoints
-
-    def _detect_cones_early(self, lidar_points, min_confidence=0.6):
-        """
-        Enhanced early cone detection using LiDAR to detect cones before camera can see them.
-        
-        Args:
-            lidar_points: Numpy array of shape (N, 3) containing LiDAR points
-            min_confidence: Minimum confidence threshold
-            
-        Returns:
-            List of additional cone points (x, depth, cls)
-        """
-        if len(lidar_points) < 50:
-            return []
-        
-        try:
-            # Filter points to likely be cones
-            ground_z = np.min(lidar_points[:, 2]) + 0.1  # Slightly above ground
-            cone_mask = (lidar_points[:, 2] < ground_z + 0.5) & (lidar_points[:, 2] > ground_z)
-            potential_cone_points = lidar_points[cone_mask]
-            
-            if len(potential_cone_points) < 10:
-                return []
-            
-            # Cluster points to find cones
-            from sklearn.cluster import DBSCAN
-            
-            # Consider only points in front of the vehicle and at reasonable distance
-            front_mask = potential_cone_points[:, 1] > 0  # y > 0 (forward)
-            distance_mask = np.sqrt(np.sum(potential_cone_points[:, :2]**2, axis=1)) < 25.0  # within 25m
-            valid_points = potential_cone_points[front_mask & distance_mask]
-            
-            if len(valid_points) < 10:
-                return []
-            
-            # Find clusters
-            clustering = DBSCAN(eps=0.5, min_samples=5).fit(valid_points[:, :3])
-            labels = clustering.labels_
-            
-            # Process clusters to find cone-like objects
-            detected_cones = []
-            unique_labels = set(labels)
-            
-            for label in unique_labels:
-                if label == -1:  # Skip noise
-                    continue
-                    
-                cluster = valid_points[labels == label]
-                
-                # Check if cluster has properties of a cone
-                # Cones are small, relatively isolated objects
-                if 5 <= len(cluster) <= 50:  # Not too few, not too many points
-                    # Calculate cluster properties
-                    center = np.mean(cluster, axis=0)
-                    x, y, z = center
-                    
-                    # Calculate cluster dimensions
-                    x_range = np.max(cluster[:, 0]) - np.min(cluster[:, 0])
-                    y_range = np.max(cluster[:, 1]) - np.min(cluster[:, 1])
-                    z_range = np.max(cluster[:, 2]) - np.min(cluster[:, 2])
-                    
-                    # Cone-like properties: small footprint, reasonable height
-                    if max(x_range, y_range) < 0.7 and 0.1 < z_range < 0.5:
-                        # This looks like a cone
-                        
-                        # Try to determine color by position (usually yellow on left, blue on right)
-                        # This is a very rough heuristic - in a real system you'd use camera data or reflectivity
-                        cone_type = 0 if x > 0 else 1  # 0 = yellow, 1 = blue
-                        
-                        # Calculate confidence based on point density and shape
-                        point_density = len(cluster) / (x_range * y_range * z_range + 0.001)
-                        shape_factor = min(1.0, max(0.1, 0.3 / max(x_range, y_range)))
-                        confidence = min(0.9, 0.5 + point_density/500 + shape_factor)
-                        
-                        if confidence >= min_confidence:
-                            # Convert to expected format
-                            detected_cones.append((x, y, cone_type, confidence))
-            
-            return detected_cones
-        
-        except Exception as e:
-            print(f"Error in early cone detection: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
-
-    def plan_path_with_fusion(self, lidar_boundaries=None, lidar_points=None):
-        """
-        Plan path using camera-detected cones, LiDAR-detected boundaries,
-        and enhanced early cone detection for improved performance.
-        
-        Args:
-            lidar_boundaries: Dictionary with 'left_boundary' and 'right_boundary' points from LiDAR
-            lidar_points: Raw LiDAR points for early cone detection
-            
-        Returns:
-            True if path planning succeeded, False otherwise
-        """
-        try:
-            # Process camera detections
-            camera_cones = []
-            camera_depths = []
-            
-            if hasattr(self.zed_camera, 'cone_detections') and self.zed_camera.cone_detections:
-                for detection in self.zed_camera.cone_detections:
-                    x1, y1, x2, y2 = detection['box']
-                    cls = detection['cls']
-                    depth = detection['depth']
-                    print(f"Camera cone: Class = {cls}, Depth = {depth:.2f}m, Box = ({x1}, {y1}, {x2}, {y2})")
-                    camera_cones.append((x1, y1, x2, y2, cls))
-                    camera_depths.append(depth)
-                
-                print(f"Using {len(camera_cones)} detected cones from camera")
-            
-            # Detect early cones with LiDAR if available
-            early_detected_cones = []
-            if lidar_points is not None and len(lidar_points) > 0:
-                early_detected_cones = self._detect_cones_early(lidar_points)
-                print(f"Detected {len(early_detected_cones)} additional cones with LiDAR")
-                
-                # Convert LiDAR-detected cones to camera format for processing
-                for x, y, cls, conf in early_detected_cones:
-                    # Only add if far enough away (beyond reliable camera detection)
-                    if y > 10.0:
-                        # Calculate approximate image coordinates based on FOV
-                        angle = np.arctan2(x, y)
-                        image_center_x = self.image_width // 2
-                        image_x = int(image_center_x + (angle / np.radians(self.fov_horizontal / 2)) * image_center_x)
-                        
-                        # Create estimated bounding box
-                        box_size = int(100 / (y/10))  # Size decreases with distance
-                        half_size = box_size // 2
-                        x1 = max(0, image_x - half_size)
-                        x2 = min(self.image_width - 1, image_x + half_size)
-                        y1 = self.image_height // 2  # Approximate position
-                        y2 = y1 + box_size
-                        
-                        # Add to camera detections list
-                        camera_cones.append((x1, y1, x2, y2, cls))
-                        camera_depths.append(y)
-                        print(f"Added early-detected cone: Class={cls}, Depth={y:.2f}m")
-            
-            # Process combined cone list
-            filtered_cones = []
-            filtered_depths = []
-            
-            if camera_cones:
-                filtered_cones, filtered_depths = self._filter_cones(camera_cones, camera_depths)
-                print(f"After filtering: {len(filtered_cones)} cones")
-            
-            # Generate camera-based waypoints
-            camera_waypoints = []
-            yellow_world = []
-            blue_world = []
-            
-            if filtered_cones:
-                # Convert to world coordinates
-                for cone, depth in zip(filtered_cones, filtered_depths):
-                    center_x = cone[0]
-                    # Calculate angle from image center
-                    angle = ((center_x - self.image_width / 2) / (self.image_width / 2)) * (self.fov_horizontal / 2)
-                    # Calculate world X coordinate
-                    world_x = depth * np.tan(np.radians(angle))
-                    
-                    # Add to world coordinates list based on class
-                    if cone[2] == 0:  # Yellow
-                        yellow_world.append((world_x, depth))
-                    else:  # Blue
-                        blue_world.append((world_x, depth))
-                
-                # Update cone lists
-                print(f"World coordinates: {len(yellow_world)} yellow cones, {len(blue_world)} blue cones")
-                
-                # Generate camera-based waypoints
-                camera_waypoints = self._pair_cones(filtered_cones, filtered_depths)
-            
-            # Process LiDAR boundaries if available
-            lidar_waypoints = []
-            if lidar_boundaries and ('left_boundary' in lidar_boundaries) and ('right_boundary' in lidar_boundaries):
-                left_boundary = lidar_boundaries['left_boundary']
-                right_boundary = lidar_boundaries['right_boundary']
-                
-                if left_boundary and right_boundary:
-                    print(f"Using LiDAR boundaries: {len(left_boundary)} left points, {len(right_boundary)} right points")
-                    
-                    # Enhance yellow/blue world lists with LiDAR boundary data
-                    for point in left_boundary:
-                        # Check if point is far enough to be useful
-                        if point[1] > 10.0 and not any(abs(y[1] - point[1]) < 2.0 for y in yellow_world):
-                            # This is a new boundary point not covered by camera
-                            yellow_world.append(point)
-                    
-                    for point in right_boundary:
-                        # Check if point is far enough to be useful
-                        if point[1] > 10.0 and not any(abs(b[1] - point[1]) < 2.0 for b in blue_world):
-                            # This is a new boundary point not covered by camera
-                            blue_world.append(point)
-                    
-                    # Generate LiDAR-based waypoints from boundaries
-                    all_depths = sorted(set([p[1] for p in left_boundary + right_boundary]))
-                    for depth in all_depths:
-                        # Find closest boundary points
-                        closest_left = None
-                        closest_right = None
-                        best_left_dist = float('inf')
-                        best_right_dist = float('inf')
-                        
-                        for point in left_boundary:
-                            dist = abs(point[1] - depth)
-                            if dist < best_left_dist:
-                                best_left_dist = dist
-                                closest_left = point
-                        
-                        for point in right_boundary:
-                            dist = abs(point[1] - depth)
-                            if dist < best_right_dist:
-                                best_right_dist = dist
-                                closest_right = point
-                        
-                        # If we have both boundaries at similar depths
-                        if closest_left and closest_right and best_left_dist < 2.0 and best_right_dist < 2.0:
-                            # Calculate midpoint
-                            midpoint_x = (closest_left[0] + closest_right[0]) / 2
-                            lidar_waypoints.append((midpoint_x, depth))
-            
-            # Fuse waypoints if we have data from both sources
-            final_waypoints = []
-            if camera_waypoints and lidar_waypoints:
-                # Use confidence-weighted fusion
-                final_waypoints = self._fuse_waypoints(camera_waypoints, lidar_waypoints)
-                print(f"Fused {len(camera_waypoints)} camera waypoints with {len(lidar_waypoints)} LiDAR waypoints")
-            elif camera_waypoints:
-                final_waypoints = camera_waypoints
-                print(f"Using {len(camera_waypoints)} camera waypoints")
-            elif lidar_waypoints:
-                final_waypoints = lidar_waypoints
-                print(f"Using {len(lidar_waypoints)} LiDAR waypoints")
-            else:
-                print("No waypoints generated from any source")
-                self.path = None
-                return False
-            
-            # Add safety margins to avoid hitting cones
-            if yellow_world or blue_world:
-                final_waypoints = self._add_cone_safety_margins(final_waypoints, yellow_world, blue_world)
-                print("Added safety margins to waypoints")
-            
-            # Limit path length to prevent extreme extrapolation
-            final_waypoints = self._limit_path_length(final_waypoints)
-            print(f"Limited path length: final path has {len(final_waypoints)} points")
-            
-            # Apply smoothing
-            if final_waypoints:
-                x_coords, y_coords = zip(*final_waypoints)
-                smoothed_x, smoothed_y = self._smooth_path(x_coords, y_coords)
-                new_path = list(zip(smoothed_x, smoothed_y))
-                
-                # Apply temporal smoothing
-                new_path = self._smooth_path_temporally(new_path)
-                
-                # Sort the path by depth to ensure smooth drawing
-                new_path.sort(key=lambda p: p[1])
-                self.path = new_path
-                
-                print(f"Path successfully created with {len(self.path)} points")
-                return True
-            
-            print("No valid path could be created")
+        # Filter cones
+        filtered_cones, filtered_depths = self._filter_cones(cones, depths)
+        if not filtered_cones:
+            print("No cones after filtering")
             self.path = None
-            return False
-                
-        except Exception as e:
-            print(f"Error in path planning: {e}")
-            import traceback
-            traceback.print_exc()
-            self.path = None
-            return False
+            return
+        
+        # Convert to world coordinates and process
+        world_cones = self._to_world_coordinates(filtered_cones, filtered_depths)
+        
+        # Pair cones
+        self._pair_cones(world_cones)
+        
+        # Connect boundary cones
+        self._connect_boundary_cones()
+        
+        # Find target point for pure pursuit
+        self._find_target_point()
+        
+        # Calculate steering angle
+        self._calculate_steering()
+        
+        # Smooth steering
+        self._smooth_steering()
+        
+        # Create path for compatibility
+        self._create_compatible_path()
+        
+        # Always visualize when called
+        if self.visualize and hasattr(self.zed_camera, 'rgb_image') and self.zed_camera.rgb_image is not None:
+            self.debug_image = self.draw_path(self.zed_camera.rgb_image.copy())
+            cv2.imshow("Pure Pursuit Path", self.debug_image)
+            cv2.waitKey(1)
+        
+        print(f"Path successfully created with {len(self.path) if self.path else 0} points!")
+    
+    except Exception as e:
+        print(f"Error in path planning with cones: {e}")
+        import traceback
+        traceback.print_exc()
+        self.path = None
+
+def plan_path_with_fusion(self, lidar_boundaries=None, lidar_points=None):
+    """
+    Plan path using camera-detected cones and LiDAR data if available.
+    Maintains compatibility with the original interface.
+    
+    Args:
+        lidar_boundaries: Dictionary with 'left_boundary' and 'right_boundary' points from LiDAR
+        lidar_points: Raw LiDAR points for early cone detection
+        
+    Returns:
+        True if path planning succeeded, False otherwise
+    """
+    try:
+        # First process camera detections
+        self._process_detections()
+        
+        # If LiDAR boundaries are available, enhance cone pairs
+        if lidar_boundaries and ('left_boundary' in lidar_boundaries or 'right_boundary' in lidar_boundaries):
+            self._enhance_with_lidar_boundaries(lidar_boundaries)
+        
+        # Connect boundary cones
+        self._connect_boundary_cones()
+        
+        # Find target point for pure pursuit
+        self._find_target_point()
+        
+        # Calculate steering angle
+        self._calculate_steering()
+        
+        # Smooth steering
+        self._smooth_steering()
+        
+        # Create path for compatibility
+        self._create_compatible_path()
+        
+        # Always visualize when called
+        if self.visualize and hasattr(self.zed_camera, 'rgb_image') and self.zed_camera.rgb_image is not None:
+            self.debug_image = self.draw_path(self.zed_camera.rgb_image.copy())
+            cv2.imshow("Pure Pursuit Path", self.debug_image)
+            cv2.waitKey(1)
+        
+        return len(self.cone_pairs) > 0
+        
+    except Exception as e:
+        print(f"Error in fusion path planning: {e}")
+        import traceback
+        traceback.print_exc()
+        self.path = None
+        return False
