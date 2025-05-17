@@ -1,0 +1,20 @@
+/**:
+  ros__parameters:
+    use_carla: true
+    carla.host: 'localhost'
+    carla.port: 2000
+    carla.timeout: 10.0
+    output_dir: './output'
+    
+    camera.width: 1280
+    camera.height: 720
+    camera.fov: 90.0
+    camera.x: 1.5
+    camera.y: 0.0
+    camera.z: 1.8
+    
+    left_topic: "/zed2i/rgb/image"
+    depth_topic: "/zed2i/depth/image"
+    camera_info_topic: "/zed2i/camera_info"
+    
+    debug_level: 1  # 0=none, 1=normal, 2=verbose

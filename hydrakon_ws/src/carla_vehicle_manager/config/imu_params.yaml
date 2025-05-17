@@ -1,0 +1,37 @@
+/**:
+  ros__parameters:
+    # CARLA connection parameters
+    carla.host: 'localhost'
+    carla.port: 2000
+    carla.timeout: 10.0
+    
+    # Update frequency for publishing data
+    update_frequency: 100.0  # 100 Hz
+    
+    # IMU sensor configuration (matches CARLA attributes)
+    imu:
+      # Acceleration noise (standard deviation in m/s²)
+      noise_accel_stddev_x: 0.01
+      noise_accel_stddev_y: 0.01
+      noise_accel_stddev_z: 0.01
+      
+      # Gyroscope noise (standard deviation in rad/s)
+      noise_gyro_stddev_x: 0.001
+      noise_gyro_stddev_y: 0.001
+      noise_gyro_stddev_z: 0.001
+      
+      # Gyroscope bias (mean noise in rad/s)
+      noise_gyro_bias_x: 0.0
+      noise_gyro_bias_y: 0.0
+      noise_gyro_bias_z: 0.0
+      
+      # Sensor timing
+      sensor_tick: 0.01  # 100 Hz
+      
+      # Random seed (0 = time-based random seed)
+      noise_seed: 0
+    
+    # Frame IDs for TF tree
+    frame_id:
+      imu: 'imu_link'
+      vehicle: 'base_link'
