@@ -1,0 +1,3 @@
+carla_host: "localhost"
+carla_port: 2000
+output_dir: "/tmp/lidar_pcd"

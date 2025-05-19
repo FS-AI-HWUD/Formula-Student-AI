@@ -1,0 +1,8 @@
+lidar_cluster_node:
+  ros__parameters:
+    raw_lidar_topic_name: "/carla/lidar"
+    lidar_cluster_topic_name: "/perception/lidar_cluster"
+    eps: 0.7
+    min_points: 2
+    debug_mode: true
+    ground_z_threshold: -2.5 
