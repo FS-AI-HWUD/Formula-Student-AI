@@ -794,6 +794,12 @@ void fs_ai_api_ai2vcu_set_data(fs_ai_api_ai2vcu *data) {
 		t_AI2VCU_FRONT_AXLE_TORQUE_REQUEST_Nm = 0.0f;
 		t_AI2VCU_REAR_AXLE_TORQUE_REQUEST_Nm = 0.0f;
 	}
+	printf("IN fs_ai_api_ai2vcu_set_data: torque=%.2f Nm, speed=%.1f rpm, steer=%.1f°, brake=%.1f\n",
+		t_AI2VCU_FRONT_AXLE_TORQUE_REQUEST_Nm,
+		t_AI2VCU_FRONT_MOTOR_SPEED_REQUEST_rpm,
+		t_AI2VCU_STEER_ANGLE_REQUEST_deg,
+		t_AI2VCU_FRONT_BRAKE_PRESS_REQUEST_pct);
+
 
 	// set requests, converting where needed
 	AI2VCU_HANDSHAKE_BIT = t_AI2VCU_HANDSHAKE_SEND_BIT;

@@ -60,8 +60,8 @@ bool HydrakonCanBridge::requestEBS(std_srvs::srv::Trigger::Request::SharedPtr, s
 void HydrakonCanBridge::loop() {
   // Read data from vehicle
   fs_ai_api_vcu2ai_get_data(&vcu2ai_);
-  fs_ai_api_gps_get_data(&gps_);
-  fs_ai_api_imu_get_data(&imu_);
+  // fs_ai_api_gps_get_data(&gps_);
+  // fs_ai_api_imu_get_data(&imu_);
 
   // Compose outbound struct
   ai2vcu_.AI2VCU_STEER_ANGLE_REQUEST_deg = steering_;
