@@ -1,3 +1,0 @@
-[submodule "fsai_ws/src/hydrakon_can/external/FS-AI_API"]
-	path = fsai_ws/src/hydrakon_can/external/FS-AI_API
-	url = git@github.com:FS-AI/FS-AI_API.git
