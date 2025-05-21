@@ -62,6 +62,7 @@ void HydrakonCanBridge::loop() {
   fs_ai_api_vcu2ai_get_data(&vcu2ai_);
   // fs_ai_api_gps_get_data(&gps_);
   // fs_ai_api_imu_get_data(&imu_);
+  // as_state_ = fs_ai_api_as_state_e::AS_DRIVING;
 
   // Compose outbound struct
   ai2vcu_.AI2VCU_STEER_ANGLE_REQUEST_deg = steering_;
