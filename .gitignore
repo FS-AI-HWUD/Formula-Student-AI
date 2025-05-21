@@ -28,3 +28,4 @@ __pycache__/
 yolo11n.pt 
 yolov8n.pt
 *.cache
+.ipynb_checkpoints
