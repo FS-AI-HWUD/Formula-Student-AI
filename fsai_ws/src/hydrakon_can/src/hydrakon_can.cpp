@@ -4,7 +4,7 @@
 using std::placeholders::_1;
 using std::placeholders::_2;
 
-HydrakonCanInterface::HydrakonCanInterface() : Node("hydrakon_can") {
+CanInterface::CanInterface() : Node("hydrakon_can") {
   // Declare ROS parameters
   can_debug_ = declare_parameter<int>("can_debug", can_debug_);
   simulate_can_ = declare_parameter<int>("simulate_can", simulate_can_);
@@ -25,33 +25,37 @@ HydrakonCanInterface::HydrakonCanInterface() : Node("hydrakon_can") {
 
   // ROS subscribers
   cmd_sub_ = this->create_subscription<ackermann_msgs::msg::AckermannDriveStamped>(
-      "/cmd", 1, std::bind(&HydrakonCanInterface::commandCallback, this, _1));
+      "/cmd", 1, std::bind(&CanInterface::commandCallback, this, _1));
   flag_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-      "/hydrakon_can/mission_completed", 1, std::bind(&HydrakonCanInterface::flagCallback, this, _1));
+      "/hydrakon_can/mission_completed", 1, std::bind(&CanInterface::flagCallback, this, _1));
   driving_flag_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-      "/state_machine/driving_flag", 1, std::bind(&HydrakonCanInterface::drivingFlagCallback, this, _1));
+      "/state_machine/driving_flag", 1, std::bind(&CanInterface::drivingFlagCallback, this, _1));
 
   // ROS publishers
-  vehicle_commands_pub_ = this->create_publisher<hydrakon_can::msg::VehicleCommand>("/hydrakon_can/vehicle_commands", 1);
-  wheel_pub_ = this->create_publisher<hydrakon_can::msg::WheelSpeed>("/hydrakon_can/wheel_speeds", 1);
-  twist_pub_ = this->create_publisher<geometry_msgs::msg::TwistWithCovarianceStamped>("/hydrakon_can/twist", 1);
+  state_pub_ = this->create_publisher<hydrakon_can::msg::CanState>("/hydrakon_can/state", 1);
+  state_pub_str_ = this->create_publisher<std_msgs::msg::String>("/hydrakon_can/state_str", 1);
+  wheel_pub_ =
+      this->create_publisher<hydrakon_can::msg::WheelSpeed>("/hydrakon_can/wheel_speeds", 1);
+  vehicle_commands_pub_ = this->create_publisher<hydrakon_can::msg::VehicleCommand>(
+      "/hydrakon_can/vehicle_commands", 1);
+  twist_pub_ =
+      this->create_publisher<geometry_msgs::msg::TwistWithCovarianceStamped>("/hydrakon_can/twist", 1);
   imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("/hydrakon_can/imu", 1);
   fix_pub_ = this->create_publisher<sensor_msgs::msg::NavSatFix>("/hydrakon_can/fix", 1);
-  state_pub_str_ = this->create_publisher<std_msgs::msg::String>("/hydrakon_can/state_str", 1);
 
   // ROS services
   ebs_srv_ = this->create_service<std_srvs::srv::Trigger>(
-      "/hydrakon_can/ebs", std::bind(&HydrakonCanInterface::requestEBS, this, _1, _2));
+      "/hydrakon_can/ebs", std::bind(&CanInterface::requestEBS, this, _1, _2));
 
   // Setup ROS timer
   std::chrono::duration<float> rate(1 / static_cast<double>(loop_rate));
-  timer_ = this->create_wall_timer(rate, std::bind(&HydrakonCanInterface::loop, this));
+  timer_ = this->create_wall_timer(rate, std::bind(&CanInterface::loop, this));
 
   // Value of 0.0 means time is uninitialised
   last_cmd_message_time_ = 0.0;
 }
 
-void HydrakonCanInterface::loop() {
+void CanInterface::loop() {
   // Get fresh data from VCU
   fs_ai_api_vcu2ai_get_data(&vcu2ai_data_);
   fs_ai_api_gps_get_data(&gps_data_);
@@ -74,6 +78,8 @@ void HydrakonCanInterface::loop() {
   RCLCPP_DEBUG(get_logger(), "%s", msg_recv.c_str());
 
   // Update AS state
+  // as_state_ = vcu2ai_data_.VCU2AI_AS_STATE;
+  // as_state_ = AS_DRIVING; //remove this when done
   as_state_ = fs_ai_api_as_state_e::AS_DRIVING;
 
   // Reset state variables when in AS_OFF
@@ -89,14 +95,18 @@ void HydrakonCanInterface::loop() {
   }
 
   // publish all received data
-  wheel_pub_->publish(HydrakonCanInterface::makeWsMessage(vcu2ai_data_));
-  twist_pub_->publish(HydrakonCanInterface::makeTwistMessage(vcu2ai_data_));
-  fix_pub_->publish(HydrakonCanInterface::makeGpsMessage(gps_data_));
-  imu_pub_->publish(HydrakonCanInterface::makeImuMessage(imu_data_));
-  vehicle_commands_pub_->publish(HydrakonCanInterface::makeVehicleCommandsMessage());
+  wheel_pub_->publish(CanInterface::makeWsMessage(vcu2ai_data_));
+  twist_pub_->publish(CanInterface::makeTwistMessage(vcu2ai_data_));
+  fix_pub_->publish(CanInterface::makeGpsMessage(gps_data_));
+  imu_pub_->publish(CanInterface::makeImuMessage(imu_data_));
+  vehicle_commands_pub_->publish(CanInterface::makeVehicleCommandsMessage());
+
+  // vcu2ai_data_.VCU2AI_AMI_STATE = fs_ai_api_ami_state_e::AMI_TRACK_DRIVE; //remove this when done
 
   // Read and publish state data
-  state_pub_str_->publish(makeStateString(vcu2ai_data_));
+  auto state_msg = CanInterface::makeStateMessage(vcu2ai_data_);
+  state_pub_->publish(state_msg);
+  state_pub_str_->publish(makeStateString(state_msg));
 
   // Assign data to be sent
   ai2vcu_data_.AI2VCU_ESTOP_REQUEST = ebs_state_;
@@ -104,9 +114,9 @@ void HydrakonCanInterface::loop() {
   ai2vcu_data_.AI2VCU_AXLE_TORQUE_REQUEST_Nm = torque_;
   ai2vcu_data_.AI2VCU_STEER_ANGLE_REQUEST_deg = steering_;
   ai2vcu_data_.AI2VCU_AXLE_SPEED_REQUEST_rpm = rpm_request_;
-  ai2vcu_data_.AI2VCU_HANDSHAKE_SEND_BIT = HydrakonCanInterface::getHandshake(vcu2ai_data_);
-  ai2vcu_data_.AI2VCU_DIRECTION_REQUEST = HydrakonCanInterface::getDirectionReq(vcu2ai_data_);
-  ai2vcu_data_.AI2VCU_MISSION_STATUS = HydrakonCanInterface::getMissionStatus(vcu2ai_data_);
+  ai2vcu_data_.AI2VCU_HANDSHAKE_SEND_BIT = CanInterface::getHandshake(vcu2ai_data_);
+  ai2vcu_data_.AI2VCU_DIRECTION_REQUEST = CanInterface::getDirectionReq(vcu2ai_data_);
+  ai2vcu_data_.AI2VCU_MISSION_STATUS = CanInterface::getMissionStatus(vcu2ai_data_);
 
   // Log sent data (in one string so log messages don't get separated)
   std::string msg_send =
@@ -129,7 +139,7 @@ void HydrakonCanInterface::loop() {
   }
 }
 
-fs_ai_api_handshake_send_bit_e HydrakonCanInterface::getHandshake(const fs_ai_api_vcu2ai_struct data) {
+fs_ai_api_handshake_send_bit_e CanInterface::getHandshake(const fs_ai_api_vcu2ai_struct data) {
   auto handshake = data.VCU2AI_HANDSHAKE_RECEIVE_BIT;
   if (handshake == fs_ai_api_handshake_receive_bit_e::HANDSHAKE_RECEIVE_BIT_OFF)
     return fs_ai_api_handshake_send_bit_e::HANDSHAKE_SEND_BIT_OFF;
@@ -137,30 +147,37 @@ fs_ai_api_handshake_send_bit_e HydrakonCanInterface::getHandshake(const fs_ai_ap
     return fs_ai_api_handshake_send_bit_e::HANDSHAKE_SEND_BIT_ON;
 }
 
-fs_ai_api_direction_request_e HydrakonCanInterface::getDirectionReq(const fs_ai_api_vcu2ai_struct data) {
+fs_ai_api_direction_request_e CanInterface::getDirectionReq(const fs_ai_api_vcu2ai_struct data) {
+  // if (data.VCU2AI_AS_STATE == fs_ai_api_as_state_e::AS_DRIVING && driving_flag_)
   if (as_state_ == fs_ai_api_as_state_e::AS_DRIVING && driving_flag_)
     return fs_ai_api_direction_request_e::DIRECTION_FORWARD;
   else
     return fs_ai_api_direction_request_e::DIRECTION_NEUTRAL;
 }
 
-fs_ai_api_mission_status_e HydrakonCanInterface::getMissionStatus(const fs_ai_api_vcu2ai_struct data) {
+fs_ai_api_mission_status_e CanInterface::getMissionStatus(const fs_ai_api_vcu2ai_struct data) {
+
   switch (data.VCU2AI_AS_STATE) {
     case fs_ai_api_as_state_e::AS_OFF:
+      // Check whether a mission has been chosen, and acknowledge it if so
       if (data.VCU2AI_AMI_STATE != fs_ai_api_ami_state_e::AMI_NOT_SELECTED)
         return fs_ai_api_mission_status_e::MISSION_SELECTED;
       else
         return fs_ai_api_mission_status_e::MISSION_NOT_SELECTED;
     case fs_ai_api_as_state_e::AS_READY:
       if (driving_flag_) {
+        // our stack is ready to start driving
         return fs_ai_api_mission_status_e::MISSION_RUNNING;
       } else {
+        // still not ready to start driving
         return fs_ai_api_mission_status_e::MISSION_SELECTED;
       }
     case fs_ai_api_as_state_e::AS_DRIVING:
       if (mission_complete_) {
+        // mission has been finished
         return fs_ai_api_mission_status_e::MISSION_FINISHED;
       } else {
+        // still doing a mission
         return fs_ai_api_mission_status_e::MISSION_RUNNING;
       }
     case fs_ai_api_as_state_e::AS_FINISHED:
@@ -168,31 +185,38 @@ fs_ai_api_mission_status_e HydrakonCanInterface::getMissionStatus(const fs_ai_ap
     default:
       return fs_ai_api_mission_status_e::MISSION_NOT_SELECTED;
   }
+  // return fs_ai_api_mission_status_e::MISSION_RUNNING; //remove this when done
 }
 
-void HydrakonCanInterface::commandCallback(ackermann_msgs::msg::AckermannDriveStamped::SharedPtr msg) {
+void CanInterface::commandCallback(ackermann_msgs::msg::AckermannDriveStamped::SharedPtr msg) {
   if (driving_flag_) {
     float acceleration = msg->drive.acceleration;
+    // Divide by two as we have two motors (front and rear) which supply identical torque
+    // 0.5 is an empirically measured constant for the rolling friction
     torque_ = (TOTAL_MASS_ * WHEEL_RADIUS_ * std::abs(acceleration + 0.5))/ 2.0;
     if (acceleration > 0.0) {
       braking_ = 0.0;
-      rpm_request_ = rpm_limit_;
+      rpm_request_ = rpm_limit_;  // Positive torque if the rpm_request is positive
     } else if (acceleration == 0.0) {
       torque_ = 0.0;
       braking_ = 0.0;
-    } else if (acceleration > engine_threshold_) {
+    } else if (acceleration > engine_threshold_) {  // Engine brake if possible
       braking_ = 0.0;
-      rpm_request_ = 0.0;
-    } else {
-      torque_ = 0.0;
-      braking_ = (-acceleration / max_dec_) * MAX_BRAKE_;
+      rpm_request_ = 0.0;  // A negative torque is achieved by an rpm_request with a value of zero
+    } else {  // If we want to decelerate faster than the engine allows, use the mechanical brakes
+      torque_ = 0.0;  // Don't engine brake and mechanical brake simultaneously
+      braking_ = (-acceleration / max_dec_) * MAX_BRAKE_;  // Braking needs to be positive
     }
 
+    // Convert from radians to degrees
     steering_ = static_cast<float>(msg->drive.steering_angle * 180.0 / M_PI);
   } else {
+    // Vehicle will not move to AS_DRIVING unless these are sSet to 0
     steering_ = 0;
     torque_ = 0;
     rpm_request_ = 0.0;
+
+    // We don't need braking unless we are driving
     braking_ = 0;
   }
 
@@ -200,14 +224,16 @@ void HydrakonCanInterface::commandCallback(ackermann_msgs::msg::AckermannDriveSt
   torque_ = checkAndTrunc(torque_, MAX_TORQUE_, "setting torque");
   braking_ = checkAndTrunc(braking_, MAX_BRAKE_, "setting brake");
 
+  // Update last message time
   last_cmd_message_time_ = this->now().seconds();
 }
 
-void HydrakonCanInterface::flagCallback(std_msgs::msg::Bool::SharedPtr msg) {
+void CanInterface::flagCallback(std_msgs::msg::Bool::SharedPtr msg) {
   mission_complete_ = msg->data;
 }
 
-void HydrakonCanInterface::drivingFlagCallback(std_msgs::msg::Bool::SharedPtr msg) {
+void CanInterface::drivingFlagCallback(std_msgs::msg::Bool::SharedPtr msg) {
+  // Driving flag can only be set to true if we're in AS_DRIVING_
   if (msg->data && as_state_ == fs_ai_api_as_state_e::AS_DRIVING) {
     driving_flag_ = true;
   } else if (msg->data) {
@@ -218,13 +244,15 @@ void HydrakonCanInterface::drivingFlagCallback(std_msgs::msg::Bool::SharedPtr ms
   }
 
   if (driving_flag_ && last_cmd_message_time_ == 0.0) {
+    // We start the cmd timeout on the positive edge of `driving_flag_`
     last_cmd_message_time_ = this->now().seconds();
   } else if (!driving_flag_) {
+    // Reset last cmd message time back to magic value (0.0) if we stop driving
     last_cmd_message_time_ = 0.0;
   }
 }
 
-bool HydrakonCanInterface::requestEBS(std_srvs::srv::Trigger::Request::SharedPtr,
+bool CanInterface::requestEBS(std_srvs::srv::Trigger::Request::SharedPtr,
                               std_srvs::srv::Trigger::Response::SharedPtr response) {
   RCLCPP_WARN(this->get_logger(), "Requesting EMERGENCY STOP");
   ebs_state_ = fs_ai_api_estop_request_e::ESTOP_YES;
@@ -232,82 +260,44 @@ bool HydrakonCanInterface::requestEBS(std_srvs::srv::Trigger::Request::SharedPtr
   return response->success;
 }
 
-// hydrakon_can::msg::VehicleCommand HydrakonCanInterface::makeVehicleCommandsMessage() {
-//   auto msg = hydrakon_can::msg::VehicleCommand();
-//   msg.header.stamp = this->get_clock()->now();
-//   msg.header.frame_id = "base_footprint";
+hydrakon_can::msg::VehicleCommand CanInterface::makeVehicleCommandsMessage() {
+  auto msg = hydrakon_can::msg::VehicleCommand();
 
-//   msg.ebs = ebs_state_;
-//   msg.braking = braking_;
-//   msg.torque = torque_;
-//   msg.steering = steering_;
-//   msg.rpm = rpm_request_;
-//   msg.handshake = HydrakonCanInterface::getHandshake(vcu2ai_data_);
-//   msg.direction = HydrakonCanInterface::getDirectionReq(vcu2ai_data_);
-//   msg.mission_status = HydrakonCanInterface::getMissionStatus(vcu2ai_data_);
+  // Populate msg
+  msg.ebs = ebs_state_;
+  msg.braking = braking_;
+  msg.torque = torque_;
+  msg.steering = steering_;
+  msg.rpm = rpm_request_;
+  msg.handshake = CanInterface::getHandshake(vcu2ai_data_);
+  msg.direction = CanInterface::getDirectionReq(vcu2ai_data_);
+  msg.mission_status = CanInterface::getMissionStatus(vcu2ai_data_);
 
-//   return msg;
-// }
-
-hydrakon_can::msg::VehicleCommand HydrakonCanInterface::makeVehicleCommandsMessage() {
-  hydrakon_can::msg::VehicleCommand msg;
-  
-  // Set the fields using the correct member variables from your class
-  msg.handshake = static_cast<int8_t>(ai2vcu_data_.AI2VCU_HANDSHAKE_SEND_BIT);
-  msg.ebs = static_cast<int8_t>(ebs_state_);
-  msg.direction = static_cast<int8_t>(ai2vcu_data_.AI2VCU_DIRECTION_REQUEST);
-  msg.mission_status = static_cast<int8_t>(mission_status_);
-  
-  msg.braking = checkAndTrunc(braking_, MAX_BRAKE_, "braking");
-  msg.torque = checkAndTrunc(torque_, MAX_TORQUE_, "torque");
-  msg.steering = checkAndTrunc(steering_, MAX_STEERING_ANGLE_DEG_, "steering", false) / 180.0 * M_PI;
-  msg.rpm = checkAndTrunc(rpm_request_, MAX_RPM_, "rpm");
-  
   return msg;
 }
 
-// hydrakon_can::msg::WheelSpeed HydrakonCanInterface::makeWsMessage(const fs_ai_api_vcu2ai_struct data) {
-//   auto msg = hydrakon_can::msg::WheelSpeed();
-//   msg.header.stamp = this->get_clock()->now();
-//   msg.header.frame_id = "base_footprint";
+hydrakon_can::msg::WheelSpeed CanInterface::makeWsMessage(const fs_ai_api_vcu2ai_struct data) {
+  auto msg = hydrakon_can::msg::WheelSpeed();
 
-//   float steering_feedback = -data.VCU2AI_STEER_ANGLE_deg;
-//   float fl_speed = data.VCU2AI_FL_WHEEL_SPEED_rpm;
-//   float fr_speed = data.VCU2AI_FR_WHEEL_SPEED_rpm;
-//   float rl_speed = data.VCU2AI_RL_WHEEL_SPEED_rpm;
-//   float rr_speed = data.VCU2AI_RR_WHEEL_SPEED_rpm;
+  float steering_feedback = -data.VCU2AI_STEER_ANGLE_deg;  // inverted to match ISO convention
+  float fl_speed = data.VCU2AI_FL_WHEEL_SPEED_rpm;
+  float fr_speed = data.VCU2AI_FR_WHEEL_SPEED_rpm;
+  float rl_speed = data.VCU2AI_RL_WHEEL_SPEED_rpm;
+  float rr_speed = data.VCU2AI_RR_WHEEL_SPEED_rpm;
 
-//   msg.fl_speed = checkAndTrunc(fl_speed, MAX_RPM_, "FL wheelspeed");
-//   msg.fr_speed = checkAndTrunc(fr_speed, MAX_RPM_, "FR wheelspeed");
-//   msg.rl_speed = checkAndTrunc(rl_speed, MAX_RPM_, "RL wheelspeed");
-//   msg.rr_speed = checkAndTrunc(rr_speed, MAX_RPM_, "RR wheelspeed");
-//   msg.steering = (checkAndTrunc(steering_feedback, MAX_STEERING_ANGLE_DEG_, "steering", false) / 180 * M_PI;
-
-//   return msg;
-// }
-
-hydrakon_can::msg::WheelSpeed HydrakonCanInterface::makeWsMessage(const fs_ai_api_vcu2ai_struct data) {
-  hydrakon_can::msg::WheelSpeed msg;
-  
-  // Calculate wheel speeds using the correct field names from the struct
-  const double fl_speed = static_cast<double>(data.VCU2AI_FL_WHEEL_SPEED_rpm);
-  const double fr_speed = static_cast<double>(data.VCU2AI_FR_WHEEL_SPEED_rpm);
-  const double rl_speed = static_cast<double>(data.VCU2AI_RL_WHEEL_SPEED_rpm);
-  const double rr_speed = static_cast<double>(data.VCU2AI_RR_WHEEL_SPEED_rpm);
-  
-  // Fix field names to match your WheelSpeed.msg
+  // check values
   msg.lf_speed = checkAndTrunc(fl_speed, MAX_RPM_, "FL wheelspeed");
   msg.rf_speed = checkAndTrunc(fr_speed, MAX_RPM_, "FR wheelspeed");
   msg.lb_speed = checkAndTrunc(rl_speed, MAX_RPM_, "RL wheelspeed");
   msg.rb_speed = checkAndTrunc(rr_speed, MAX_RPM_, "RR wheelspeed");
-  
-  // Set the steering field using the correct field from the struct
-  msg.steering = checkAndTrunc(-data.VCU2AI_STEER_ANGLE_deg, MAX_STEERING_ANGLE_DEG_, "steering", false) / 180.0 * M_PI;
-  
+
+  steering_feedback = checkAndTrunc(steering_feedback, MAX_STEERING_ANGLE_DEG_, "steering", false);
+  msg.steering = (steering_feedback / 180) * M_PI;  // convert to radians
+
   return msg;
 }
 
-geometry_msgs::msg::TwistWithCovarianceStamped HydrakonCanInterface::makeTwistMessage(
+geometry_msgs::msg::TwistWithCovarianceStamped CanInterface::makeTwistMessage(
     const fs_ai_api_vcu2ai_struct data) {
   auto msg = geometry_msgs::msg::TwistWithCovarianceStamped();
   msg.header.stamp = get_clock()->now();
@@ -322,6 +312,7 @@ geometry_msgs::msg::TwistWithCovarianceStamped HydrakonCanInterface::makeTwistMe
   auto steering_angle =
       checkAndTrunc(-data.VCU2AI_STEER_ANGLE_deg, MAX_STEERING_ANGLE_DEG_, "steering", false) /
       180 * M_PI;
+  // auto steering_angle = 10.0 / 180.0 * M_PI;
 
   msg.twist.twist.angular.z = msg.twist.twist.linear.x * sin(steering_angle) / WHEELBASE_;
 
@@ -335,16 +326,19 @@ geometry_msgs::msg::TwistWithCovarianceStamped HydrakonCanInterface::makeTwistMe
   return msg;
 }
 
-sensor_msgs::msg::Imu HydrakonCanInterface::makeImuMessage(const fs_ai_api_imu_struct &data) {
+sensor_msgs::msg::Imu CanInterface::makeImuMessage(const fs_ai_api_imu_struct &data) {
+  // Initialise message
   sensor_msgs::msg::Imu msg;
   msg.header.stamp = this->get_clock()->now();
   msg.header.frame_id = "base_footprint";
 
+  // Get accelerations
   const float G_VALUE = 9.80665;
   msg.linear_acceleration.x = data.IMU_Acceleration_X_mG * 1000 * G_VALUE;
   msg.linear_acceleration.y = data.IMU_Acceleration_Y_mG * 1000 * G_VALUE;
   msg.linear_acceleration.z = data.IMU_Acceleration_Z_mG * 1000 * G_VALUE;
 
+  // Get angular velocity
   msg.angular_velocity.x = (data.IMU_Rotation_X_degps / 180) * M_PI;
   msg.angular_velocity.y = (data.IMU_Rotation_Y_degps / 180) * M_PI;
   msg.angular_velocity.z = (data.IMU_Rotation_Z_degps / 180) * M_PI;
@@ -352,11 +346,12 @@ sensor_msgs::msg::Imu HydrakonCanInterface::makeImuMessage(const fs_ai_api_imu_s
   return msg;
 }
 
-sensor_msgs::msg::NavSatFix HydrakonCanInterface::makeGpsMessage(const fs_ai_api_gps_struct &data) {
+sensor_msgs::msg::NavSatFix CanInterface::makeGpsMessage(const fs_ai_api_gps_struct &data) {
   sensor_msgs::msg::NavSatFix msg;
   msg.header.stamp = this->get_clock()->now();
   msg.header.frame_id = "base_footprint";
 
+  // Double check these with real values
   msg.altitude = data.GPS_Altitude;
   msg.latitude = data.GPS_Latitude_Degree + data.GPS_Latitude_Minutes / 60;
   msg.longitude = data.GPS_Longitude_Degree + data.GPS_Longitude_Minutes / 60;
@@ -364,46 +359,125 @@ sensor_msgs::msg::NavSatFix HydrakonCanInterface::makeGpsMessage(const fs_ai_api
   return msg;
 }
 
-std_msgs::msg::String HydrakonCanInterface::makeStateString(const fs_ai_api_vcu2ai_struct &data) {
+hydrakon_can::msg::CanState CanInterface::makeStateMessage(const fs_ai_api_vcu2ai_struct &data) {
+  hydrakon_can::msg::CanState msg;
+
+  switch (data.VCU2AI_AS_STATE) {
+    case fs_ai_api_as_state_e::AS_OFF:
+      msg.as_state = hydrakon_can::msg::CanState::AS_OFF;
+      break;
+    case fs_ai_api_as_state_e::AS_READY:
+      msg.as_state = hydrakon_can::msg::CanState::AS_READY;
+      break;
+    case fs_ai_api_as_state_e::AS_DRIVING:
+      msg.as_state = hydrakon_can::msg::CanState::AS_DRIVING;
+      break;
+    case fs_ai_api_as_state_e::AS_EMERGENCY_BRAKE:
+      msg.as_state = hydrakon_can::msg::CanState::AS_EMERGENCY_BRAKE;
+      break;
+    case fs_ai_api_as_state_e::AS_FINISHED:
+      msg.as_state = hydrakon_can::msg::CanState::AS_FINISHED;
+      break;
+    default:
+      msg.as_state = hydrakon_can::msg::CanState::AS_OFF;
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                           "Invalid AS state from vehicle.");
+  }
+
+  switch (data.VCU2AI_AMI_STATE) {
+    case fs_ai_api_ami_state_e::AMI_NOT_SELECTED:
+      msg.ami_state = hydrakon_can::msg::CanState::AMI_NOT_SELECTED;
+      break;
+    case fs_ai_api_ami_state_e::AMI_ACCELERATION:
+      msg.ami_state = hydrakon_can::msg::CanState::AMI_ACCELERATION;
+      break;
+    case fs_ai_api_ami_state_e::AMI_SKIDPAD:
+      msg.ami_state = hydrakon_can::msg::CanState::AMI_SKIDPAD;
+      break;
+    case fs_ai_api_ami_state_e::AMI_AUTOCROSS:
+      msg.ami_state = hydrakon_can::msg::CanState::AMI_AUTOCROSS;
+      break;
+    case fs_ai_api_ami_state_e::AMI_TRACK_DRIVE:
+      msg.ami_state = hydrakon_can::msg::CanState::AMI_TRACK_DRIVE;
+      break;
+    case fs_ai_api_ami_state_e::AMI_STATIC_INSPECTION_A:
+      msg.ami_state = hydrakon_can::msg::CanState::AMI_DDT_INSPECTION_A;
+      break;
+    case fs_ai_api_ami_state_e::AMI_STATIC_INSPECTION_B:
+      msg.ami_state = hydrakon_can::msg::CanState::AMI_DDT_INSPECTION_B;
+      break;
+    case fs_ai_api_ami_state_e::AMI_AUTONOMOUS_DEMO:
+      msg.ami_state = hydrakon_can::msg::CanState::AMI_AUTONOMOUS_DEMO;
+      break;
+    default:
+      msg.ami_state = hydrakon_can::msg::CanState::AMI_NOT_SELECTED;
+      RCLCPP_WARN(this->get_logger(), "Invalid AMI state from vehicle.");
+  }
+
+  return msg;
+}
+
+std_msgs::msg::String CanInterface::makeStateString(hydrakon_can::msg::CanState &state) {
   std::string str1;
   std::string str2;
   std::string str3;
 
-  switch (data.VCU2AI_AS_STATE) {
-    case fs_ai_api_as_state_e::AS_OFF:
+  switch (state.as_state) {
+    case hydrakon_can::msg::CanState::AS_OFF:
       str1 = "AS:OFF";
       break;
-    case fs_ai_api_as_state_e::AS_READY:
+    case hydrakon_can::msg::CanState::AS_READY:
       str1 = "AS:READY";
       break;
-    case fs_ai_api_as_state_e::AS_DRIVING:
+    case hydrakon_can::msg::CanState::AS_DRIVING:
       str1 = "AS:DRIVING";
       break;
-    case fs_ai_api_as_state_e::AS_FINISHED:
+    case hydrakon_can::msg::CanState::AS_FINISHED:
       str1 = "AS:FINISHED";
       break;
-    case fs_ai_api_as_state_e::AS_EMERGENCY_BRAKE:
+    case hydrakon_can::msg::CanState::AS_EMERGENCY_BRAKE:
       str1 = "AS:EMERGENCY";
       break;
     default:
       str1 = "NO_SUCH_MESSAGE";
   }
 
-  switch (data.VCU2AI_AMI_STATE) {
-    case fs_ai_api_ami_state_e::AMI_NOT_SELECTED:
+  switch (state.ami_state) {
+    case hydrakon_can::msg::CanState::AMI_NOT_SELECTED:
       str2 = "AMI:NOT_SELECTED";
       break;
-    case fs_ai_api_ami_state_e::AMI_ACCELERATION:
+    case hydrakon_can::msg::CanState::AMI_ACCELERATION:
       str2 = "AMI:ACCELERATION";
       break;
-    case fs_ai_api_ami_state_e::AMI_SKIDPAD:
+    case hydrakon_can::msg::CanState::AMI_SKIDPAD:
       str2 = "AMI:SKIDPAD";
       break;
-    case fs_ai_api_ami_state_e::AMI_AUTOCROSS:
+    case hydrakon_can::msg::CanState::AMI_AUTOCROSS:
       str2 = "AMI:AUTOCROSS";
       break;
-    case fs_ai_api_ami_state_e::AMI_TRACK_DRIVE:
+    case hydrakon_can::msg::CanState::AMI_TRACK_DRIVE:
       str2 = "AMI:TRACKDRIVE";
+      break;
+    case hydrakon_can::msg::CanState::AMI_DDT_INSPECTION_A:
+      str2 = "AMI:INSPECTION_A";
+      break;
+    case hydrakon_can::msg::CanState::AMI_DDT_INSPECTION_B:
+      str2 = "AMI:INSPECTION_B";
+      break;
+    case hydrakon_can::msg::CanState::AMI_AUTONOMOUS_DEMO:
+      str2 = "AMI:AUTONOMOUS_DEMO";
+      break;
+    case hydrakon_can::msg::CanState::AMI_ADS_INSPECTION:
+      str2 = "AMI:ADS_INSPECTION";
+      break;
+    case hydrakon_can::msg::CanState::AMI_ADS_EBS:
+      str2 = "AMI:ADS_EBS";
+      break;
+    case hydrakon_can::msg::CanState::AMI_JOYSTICK:
+      str2 = "AMI:JOYSTICK";
+      break;
+    case hydrakon_can::msg::CanState::AMI_MANUAL:
+      str2 = "AMI:MANUAL";
       break;
     default:
       str2 = "NO_SUCH_MESSAGE";
@@ -419,7 +493,8 @@ std_msgs::msg::String HydrakonCanInterface::makeStateString(const fs_ai_api_vcu2
   return msg;
 }
 
-float HydrakonCanInterface::checkAndTrunc(const float val, const float max_val, const std::string type,
+// Checks if value exceeds max allowed value, if it does truncate it and warn
+float CanInterface::checkAndTrunc(const float val, const float max_val, const std::string type,
                                   bool trunc_at_zero) {
   float min_val = trunc_at_zero ? 0 : -max_val;
   if (val > max_val) {
@@ -434,8 +509,9 @@ float HydrakonCanInterface::checkAndTrunc(const float val, const float max_val, 
   return val;
 }
 
-int HydrakonCanInterface::checkAndTrunc(const int val, const int max_val, std::string type,
+int CanInterface::checkAndTrunc(const int val, const int max_val, std::string type,
                                 bool trunc_at_zero) {
+  // Replicated because casting to float from int could lose information
   int min_val = trunc_at_zero ? 0 : -max_val;
   if (val > max_val) {
     RCLCPP_DEBUG(get_logger(), "%s was %i but max is %i", type.c_str(), val, max_val);
@@ -449,7 +525,8 @@ int HydrakonCanInterface::checkAndTrunc(const int val, const int max_val, std::s
   return val;
 }
 
-void HydrakonCanInterface::checkTimeout() {
+void CanInterface::checkTimeout() {
+  // Engage EBS if the duration between last message time and now exceeds threshold
   if (this->now().seconds() - last_cmd_message_time_ > cmd_timeout_) {
     RCLCPP_ERROR(get_logger(), "/cmd sent nothing for %f seconds, requesting EMERGENCY STOP",
                  cmd_timeout_);
@@ -459,7 +536,7 @@ void HydrakonCanInterface::checkTimeout() {
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<HydrakonCanInterface>());
+  rclcpp::spin(std::make_shared<CanInterface>());
   rclcpp::shutdown();
   return 0;
 }

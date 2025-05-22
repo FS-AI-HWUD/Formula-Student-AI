@@ -718,6 +718,10 @@ void fs_ai_api_ai2vcu_set_data(fs_ai_api_ai2vcu *data) {
 
 	uint16_t t_fastest_wheel_rpm = 0;
 
+	// added to the api
+	t_FRONT_AXLE_TORQUE_MAX_Nm = 195.0f; 
+    t_REAR_AXLE_TORQUE_MAX_Nm = 195.0f;
+
 	if(VCU2AI_FL_WHEEL_SPEED_rpm > t_fastest_wheel_rpm) { t_fastest_wheel_rpm = VCU2AI_FL_WHEEL_SPEED_rpm; }
 	if(VCU2AI_FR_WHEEL_SPEED_rpm > t_fastest_wheel_rpm) { t_fastest_wheel_rpm = VCU2AI_FR_WHEEL_SPEED_rpm; }
 	if(VCU2AI_RL_WHEEL_SPEED_rpm > t_fastest_wheel_rpm) { t_fastest_wheel_rpm = VCU2AI_RL_WHEEL_SPEED_rpm; }

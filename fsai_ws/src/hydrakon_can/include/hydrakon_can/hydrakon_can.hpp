@@ -6,6 +6,9 @@
 #include <string>
 
 #include <ackermann_msgs/msg/ackermann_drive_stamped.hpp>
+#include <hydrakon_can/msg/can_state.hpp>
+#include <hydrakon_can/msg/vehicle_command.hpp>
+#include <hydrakon_can/msg/wheel_speed.hpp>
 #include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -14,22 +17,20 @@
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
+
 #include "fs-ai_api.h"  // NOLINT(build/include_subdir)
-#include "hydrakon_can/msg/vehicle_command.hpp"
-#include "hydrakon_can/msg/wheel_speed.hpp"
-#include "hydrakon_can/hydrakon_can.hpp"
 
 /**
- * @class HydrakonCanInterface
- * @brief Interface to communicate with the HYDRAKON autonomous vehicle through CAN
+ * @class CanInterface
+ * @brief Interface to communicate with the ADS-DV autonomous car through CAN
  *
- * This program uses the FS-AI library to interface with the HYDRAKON and
+ * This program uses the FS-AI library to interface with the ADS-DV and
  * is effectively a ROS wrapper for the library.
  */
 
-class HydrakonCanInterface : public rclcpp::Node {
+class CanInterface : public rclcpp::Node {
  public:
-  HydrakonCanInterface();  // Constructor
+  CanInterface();  // Constructor
 
   int loop_rate = 100;  // Operational rate of the node
 
@@ -44,12 +45,13 @@ class HydrakonCanInterface : public rclcpp::Node {
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr driving_flag_sub_;
 
   // ROS publishers
-  rclcpp::Publisher<hydrakon_can::msg::VehicleCommand>::SharedPtr vehicle_commands_pub_;
+  rclcpp::Publisher<hydrakon_can::msg::CanState>::SharedPtr state_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_str_;
   rclcpp::Publisher<hydrakon_can::msg::WheelSpeed>::SharedPtr wheel_pub_;
+  rclcpp::Publisher<hydrakon_can::msg::VehicleCommand>::SharedPtr vehicle_commands_pub_;
   rclcpp::Publisher<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr twist_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
   rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr fix_pub_;
-  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_str_;
 
   // ROS service
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr ebs_srv_;
@@ -80,9 +82,9 @@ class HydrakonCanInterface : public rclcpp::Node {
   const float MAX_RPM_ = 4000;               // Maximum available RPM of the car
   const float MAX_BRAKE_ = 100;              // Maximum available braking of the car
   const float MAX_STEERING_ANGLE_DEG_ = 24;  // Max steering angle (degrees)
-  const float WHEEL_RADIUS_ = 0.253;         // Radius of wheels
-  const float WHEELBASE_ = 1.53;             // Wheelbase of the vehicle
-  const float TOTAL_MASS_ = 300;             // Total mass of the vehicle in kg
+  const float WHEEL_RADIUS_ = 0.253;         // Radius of DDT car wheels
+  const float WHEELBASE_ = 1.53;             // Wheelbase of the DDT car
+  const float TOTAL_MASS_ = 300;             // Total mass of the DDT car in kg
 
   // Variables
   float steering_ = 0;    // Desired steering
@@ -136,13 +138,13 @@ class HydrakonCanInterface : public rclcpp::Node {
   void drivingFlagCallback(const std_msgs::msg::Bool::SharedPtr msg);
 
   /**
-   * Creates a VehicleCommand message which contains the same
+   * Creates a hydrakon_can/VehicleCommand message which contains the same
    * information that is sent to the car (e.g torque and steering commands)
    */
   hydrakon_can::msg::VehicleCommand makeVehicleCommandsMessage();
 
   /**
-   * Creates a WheelSpeed message. Converts raw values
+   * Creates a hydrakon_can/WheelSpeed message. Converts raw values
    * to SI units and the appropriate convention we are using.
    * @param data received from the CAN bus
    */
@@ -168,10 +170,16 @@ class HydrakonCanInterface : public rclcpp::Node {
   sensor_msgs::msg::NavSatFix makeGpsMessage(const fs_ai_api_gps_struct &data);
 
   /**
-   * Creates a string message with the internal state of the car for debugging.
+   * Creates a hydrakon_can/CanState message using the internal state of the car.
    * @param data received from the CAN bus
    */
-  std_msgs::msg::String makeStateString(const fs_ai_api_vcu2ai_struct &data);
+  hydrakon_can::msg::CanState makeStateMessage(const fs_ai_api_vcu2ai_struct &data);
+
+  /**
+   * Creates an analogous message to hydrakon_can/CanState but in string format for easy reading.
+   * @param state of the car
+   */
+  std_msgs::msg::String makeStateString(hydrakon_can::msg::CanState &state);
 
   /**
    * Warns if a values has exceeded it's limits and returns its trunctuated value
