@@ -1,36 +1,38 @@
 #ifndef INCLUDE_HYDRAKON_CAN_HPP_
 #define INCLUDE_HYDRAKON_CAN_HPP_
 
-#include <tf2/LinearMath/Quaternion.h>
+#include <rclcpp/rclcpp.hpp>
 
 #include <string>
-
+#include <unordered_map>
+#include <tf2/LinearMath/Quaternion.h>
 #include <ackermann_msgs/msg/ackermann_drive_stamped.hpp>
-#include <hydrakon_can/msg/can_state.hpp>
-#include <hydrakon_can/msg/vehicle_command.hpp>
-#include <hydrakon_can/msg/wheel_speed.hpp>
 #include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
-#include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/imu.hpp>
-#include <sensor_msgs/msg/nav_sat_fix.hpp>
+
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
+#include <hydrakon_can/msg/can_state.hpp>
+#include <hydrakon_can/msg/vehicle_command.hpp>
+#include <hydrakon_can/msg/wheel_speed.hpp>
+
+// #include <sensor_msgs/msg/imu.hpp>
+// #include <sensor_msgs/msg/nav_sat_fix.hpp>
 
 #include "fs-ai_api.h"  // NOLINT(build/include_subdir)
 
 /**
- * @class CanInterface
+ * @class HydrakonCanInterface
  * @brief Interface to communicate with the ADS-DV autonomous car through CAN
  *
  * This program uses the FS-AI library to interface with the ADS-DV and
  * is effectively a ROS wrapper for the library.
  */
 
-class CanInterface : public rclcpp::Node {
+class HydrakonCanInterface : public rclcpp::Node {
  public:
-  CanInterface();  // Constructor
+  HydrakonCanInterface();  // Constructor
 
   int loop_rate = 100;  // Operational rate of the node
 
@@ -46,12 +48,12 @@ class CanInterface : public rclcpp::Node {
 
   // ROS publishers
   rclcpp::Publisher<hydrakon_can::msg::CanState>::SharedPtr state_pub_;
-  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_str_;
-  rclcpp::Publisher<hydrakon_can::msg::WheelSpeed>::SharedPtr wheel_pub_;
-  rclcpp::Publisher<hydrakon_can::msg::VehicleCommand>::SharedPtr vehicle_commands_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_str_pub_;
+  rclcpp::Publisher<hydrakon_can::msg::WheelSpeed>::SharedPtr wheel_speed_pub_;
+  rclcpp::Publisher<hydrakon_can::msg::VehicleCommand>::SharedPtr vehicle_command_pub_;
   rclcpp::Publisher<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr twist_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr fix_pub_;
+  // rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
+  // rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr fix_pub_;
 
   // ROS service
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr ebs_srv_;
@@ -65,8 +67,8 @@ class CanInterface : public rclcpp::Node {
   // FS-AI API structs to store data
   struct fs_ai_api_vcu2ai_struct vcu2ai_data_;  // Data received from the car
   struct fs_ai_api_ai2vcu_struct ai2vcu_data_;  // Data sent to the car
-  struct fs_ai_api_gps_struct gps_data_;        // GPS received from the car
-  struct fs_ai_api_imu_struct imu_data_;        // IMU received from the car
+  // struct fs_ai_api_gps_struct gps_data_;        // GPS received from the car
+  // struct fs_ai_api_imu_struct imu_data_;        // IMU received from the car
 
   // FS-AI API state enums
   fs_ai_api_mission_status_e mission_status_ = fs_ai_api_mission_status_e::MISSION_NOT_SELECTED;
@@ -99,7 +101,7 @@ class CanInterface : public rclcpp::Node {
   bool mission_complete_ = false;
   bool driving_flag_ = false;
 
-  /**
+  /**SS
    * Handles the handshake bits and returns the one to be sent back to the car
    * @param data received from the CAN bus
    */
@@ -116,7 +118,7 @@ class CanInterface : public rclcpp::Node {
    * AS_DRIVING state and driving flag is true, Neutral otherwise.
    * @param data received from the CAN bus
    */
-  fs_ai_api_direction_request_e getDirectionReq(const fs_ai_api_vcu2ai_struct data);
+  fs_ai_api_direction_request_e getDirectionRequest(const fs_ai_api_vcu2ai_struct data);
 
   /**
    * Sets torque/brake and steering commands for the car. Converts
@@ -141,14 +143,14 @@ class CanInterface : public rclcpp::Node {
    * Creates a hydrakon_can/VehicleCommand message which contains the same
    * information that is sent to the car (e.g torque and steering commands)
    */
-  hydrakon_can::msg::VehicleCommand makeVehicleCommandsMessage();
+  hydrakon_can::msg::VehicleCommand makeVehicleCommandMessage();
 
   /**
    * Creates a hydrakon_can/WheelSpeed message. Converts raw values
    * to SI units and the appropriate convention we are using.
    * @param data received from the CAN bus
    */
-  hydrakon_can::msg::WheelSpeed makeWsMessage(const fs_ai_api_vcu2ai_struct data);
+  hydrakon_can::msg::WheelSpeed makeWheelSpeedMessage(const fs_ai_api_vcu2ai_struct data);
 
   /**
    * Creates a geometry_msgs/TwistWithCovarianceStamped message from wheel speeds
@@ -161,13 +163,13 @@ class CanInterface : public rclcpp::Node {
    * Creates an IMU message.
    * @param data received from the CAN bus
    */
-  sensor_msgs::msg::Imu makeImuMessage(const fs_ai_api_imu_struct &data);
+  // sensor_msgs::msg::Imu makeImuMessage(const fs_ai_api_imu_struct &data);
 
   /**
    * Creates a GPS message.
    * @param data received from the CAN bus
    */
-  sensor_msgs::msg::NavSatFix makeGpsMessage(const fs_ai_api_gps_struct &data);
+  // sensor_msgs::msg::NavSatFix makeGpsMessage(const fs_ai_api_gps_struct &data);
 
   /**
    * Creates a hydrakon_can/CanState message using the internal state of the car.
