@@ -1,15 +1,15 @@
 # hydrakon_can
 
-This module provides a bridge between **ROS 2 vehicle control commands** and a **CAN bus (`can0`)**, simulating the process of sending and receiving data with the ADS-DV.
+This module provides a bridge between **ROS 2 vehicle control commands** and a **CAN bus (`can0`)**, for the process of sending and receiving CAN data with the ADS-DV.
 
 ## Overview
 
-The system connects a ROS2 control node to a simulated CAN interface using a `hydrakon_can_node` bridge. This setup enables testing of vehicle control logic without the need for physical CAN hardware.
+The system connects a ROS2 control node to the ADS-DV CAN interface using a `hydrakon_can_node` bridge. This setup also enables testing of vehicle control logic without the need for physical CAN hardware.
 
 ## Requirements
 
 - ROS 2 (Humble, Foxy, or compatible)
-- `socketCAN` and `vcan`  modules
+- `socketCAN` , additionally `vcan`  module for testing.
 - `FS_AI CAN` interface llibrary for encoding/decoding CAN frames
 - `hydrakon_can` node bridge implementation
 
