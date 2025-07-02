@@ -7,7 +7,7 @@ def generate_launch_description():
         executable="hydrakon_can_node",
         name="hydrakon_can",
         parameters=[
-            {"use_sim_time": True},
+            {"use_sim_time": False}, #when using Carla etc
             {"can_debug": 1},
             {"simulate_can": 1},
             {"can_interface": "vcan0"},
@@ -15,7 +15,7 @@ def generate_launch_description():
             {"rpm_limit": 100.0}, # must be float!
             {"max_acc": 5.0},
             {"max_braking": 5.0},
-            {"cmd_timeout": 0.5}
+            {"cmd_timeout": 0.5} #ros pub every 1s
         ],
         # arguments=['--ros-args', '--log-level', 'debug'],
     )

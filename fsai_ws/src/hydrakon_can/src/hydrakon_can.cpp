@@ -5,7 +5,7 @@ using std::placeholders::_1;
 using std::placeholders::_2;
 
 HydrakonCanInterface::HydrakonCanInterface() : Node("hydrakon_can") {
-  // Declare ROS parameters
+  // init ROS parameters preset in launch file
   can_debug_ = declare_parameter<int>("can_debug", can_debug_);
   simulate_can_ = declare_parameter<int>("simulate_can", simulate_can_);
   can_interface_ = declare_parameter<std::string>("can_interface", can_interface_);
@@ -44,7 +44,9 @@ HydrakonCanInterface::HydrakonCanInterface() : Node("hydrakon_can") {
 
   // Setup ROS timer
   std::chrono::duration<float> rate(1 / static_cast<double>(loop_rate));
+  rclcpp::sleep_for(std::chrono::milliseconds(200));
   timer_ = this->create_wall_timer(rate, std::bind(&HydrakonCanInterface::loop, this));
+  RCLCPP_INFO_ONCE(this->get_logger(), "ROS Time Now = %.2f", this->now().seconds());
 
   // Value of 0.0 means time is uninitialised
   last_cmd_message_time_ = 0.0;
@@ -73,9 +75,9 @@ void HydrakonCanInterface::loop() {
   RCLCPP_DEBUG(get_logger(), "%s", msg_recv.c_str());
 
   // Update AS state
-  as_state_ = vcu2ai_data_.VCU2AI_AS_STATE;
+  //as_state_ = vcu2ai_data_.VCU2AI_AS_STATE;
   // as_state_ = AS_DRIVING; //remove this when done
-  // as_state_ = fs_ai_api_as_state_e::AS_DRIVING;
+  as_state_ = fs_ai_api_as_state_e::AS_DRIVING; //temporarily set to driving default
 
   // Reset state variables when in AS_OFF
   if (as_state_ == fs_ai_api_as_state_e::AS_OFF) {
@@ -190,7 +192,8 @@ fs_ai_api_mission_status_e HydrakonCanInterface::getMissionStatus(const fs_ai_ap
 void HydrakonCanInterface::commandCallback(ackermann_msgs::msg::AckermannDriveStamped::SharedPtr msg) {
   if (driving_flag_) {
     const float acceleration = msg->drive.acceleration;
-
+    // ebs_state_ = fs_ai_api_estop_request_e::ESTOP_NO;
+    // last_cmd_message_time_ = this->now().seconds(); 
     // Always calculate torque baseline (may be set to 0 later)
     float torque = (TOTAL_MASS_ * WHEEL_RADIUS_ * std::abs(acceleration + 0.5f)) / 2.0f;
 
@@ -252,13 +255,13 @@ void HydrakonCanInterface::drivingFlagCallback(std_msgs::msg::Bool::SharedPtr ms
     driving_flag_ = msg->data;
   }
 
-  if (driving_flag_ && last_cmd_message_time_ == 0.0) {
-    // We start the cmd timeout on the positive edge of `driving_flag_`
-    last_cmd_message_time_ = this->now().seconds();
-  } else if (!driving_flag_) {
-    // Reset last cmd message time back to magic value (0.0) if we stop driving
-    last_cmd_message_time_ = 0.0;
-  }
+  // if (driving_flag_ && last_cmd_message_time_ == 0.0) {
+  //   // We start the cmd timeout on the positive edge of `driving_flag_`
+  // //   last_cmd_message_time_ = this->now().seconds();
+  // } else if (!driving_flag_) {
+  //   // Reset last cmd message time back to magic value (0.0) if we stop driving
+  //   last_cmd_message_time_ = 0.0;
+  // }
 }
 
 bool HydrakonCanInterface::requestEBS(std_srvs::srv::Trigger::Request::SharedPtr,
@@ -476,10 +479,17 @@ int HydrakonCanInterface::checkAndTrunc(const int val, const int max_val, std::s
 }
 
 void HydrakonCanInterface::checkTimeout() {
-  // Engage EBS if the duration between last message time and now exceeds threshold
-  if (this->now().seconds() - last_cmd_message_time_ > cmd_timeout_) {
-    RCLCPP_ERROR(get_logger(), "/hydrakon_can/cmd sent nothing for %f seconds, requesting EMERGENCY STOP",
-                 cmd_timeout_);
+  const double now = this->now().seconds();
+  // Wait until time starts and node has run at least once
+  if (last_cmd_message_time_ < 0.1 || now < 0.1) {
+    return;
+  }
+
+  const double dt = now - last_cmd_message_time_;
+  if (dt > cmd_timeout_) {
+    if (ebs_state_ != fs_ai_api_estop_request_e::ESTOP_YES) {
+      RCLCPP_ERROR(get_logger(), "/hydrakon_can/cmd timeout after %.2f seconds, triggering EBS", dt);
+    }
     ebs_state_ = fs_ai_api_estop_request_e::ESTOP_YES;
   }
 }
